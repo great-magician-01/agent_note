@@ -102,6 +102,7 @@ type Message struct {
 	Role           string    `gorm:"size:16;not null" json:"role"` // user|assistant|tool
 	Content        string    `gorm:"type:text;not null;default:''" json:"content"`
 	ToolCalls      *string   `gorm:"type:jsonb" json:"tool_calls,omitempty"` // assistant 工具调用（原样回放）
+	Reasoning      *string   `gorm:"type:text" json:"reasoning,omitempty"`   // assistant 思考内容（推理模型）
 	ToolCallID     string    `gorm:"size:64" json:"tool_call_id,omitempty"`  // tool 消息归属
 	Name           string    `gorm:"size:64" json:"name,omitempty"`          // tool 消息工具名
 	IsActive       int       `gorm:"not null;default:1" json:"-"`

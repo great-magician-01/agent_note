@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -162,16 +164,49 @@ func Chat(c *gin.Context) {
 	}
 
 	for round := 0; round < maxAgentRounds; round++ {
-		result, err := client.ChatStream(ctx, messages, tools, func(delta string) {
-			sse.event("delta", gin.H{"content": delta})
-		})
+		result, err := client.ChatStream(ctx, messages, tools,
+			func(delta string) {
+				sse.event("delta", gin.H{"content": delta})
+			},
+			func(think string) {
+				sse.event("think", gin.H{"content": think})
+			},
+		)
 		if err != nil {
+			// 客户端中断（页面停止/关闭）：上游请求已随 ctx 取消断开。
+			// 把本轮已流出的部分正文/思考落库（截断的工具调用参数不完整，直接丢弃不执行），
+			// 连接已断，静默收尾不再发事件
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				if result != nil && (result.Content != "" || result.Reasoning != "") {
+					var rp *string
+					if result.Reasoning != "" {
+						rp = &result.Reasoning
+					}
+					pendingMsgs = append(pendingMsgs, models.Message{
+						ID:             snowflake.Next(),
+						ConversationID: conv.ID,
+						Role:           "assistant",
+						Content:        result.Content,
+						Reasoning:      rp,
+					})
+				}
+				for i := range pendingMsgs {
+					database.DB.Create(&pendingMsgs[i])
+				}
+				return
+			}
 			fail(err.Error())
 			// 已产生的消息也尽量落库
 			for i := range pendingMsgs {
 				database.DB.Create(&pendingMsgs[i])
 			}
 			return
+		}
+
+		// 思考内容（推理模型）随 assistant 消息落库
+		var reasoningPtr *string
+		if result.Reasoning != "" {
+			reasoningPtr = &result.Reasoning
 		}
 
 		// 无工具调用 → 最终回复，落库 assistant 消息并结束
@@ -181,6 +216,7 @@ func Chat(c *gin.Context) {
 				ConversationID: conv.ID,
 				Role:           "assistant",
 				Content:        result.Content,
+				Reasoning:      reasoningPtr,
 			})
 			flushAndDone()
 			return
@@ -195,6 +231,7 @@ func Chat(c *gin.Context) {
 			Role:           "assistant",
 			Content:        result.Content,
 			ToolCalls:      &tcStr,
+			Reasoning:      reasoningPtr,
 		})
 		messages = append(messages, ai.Message{
 			Role:      "assistant",
@@ -203,7 +240,7 @@ func Chat(c *gin.Context) {
 		})
 
 		for _, tc := range result.ToolCalls {
-			sse.event("tool_start", gin.H{"name": tc.Function.Name, "input": json.RawMessage(tc.Function.Arguments)})
+			sse.event("tool_start", gin.H{"id": tc.ID, "name": tc.Function.Name, "input": json.RawMessage(tc.Function.Arguments)})
 
 			toolResult, execErr := ai.Execute(tc.Function.Name, tc.Function.Arguments)
 
@@ -222,7 +259,12 @@ func Chat(c *gin.Context) {
 				summary = execErr.Error()
 			}
 
-			sse.event("tool_end", gin.H{"name": tc.Function.Name, "ok": ok, "summary": summary})
+			// 结果截断随事件下发（展开面板预览用；完整内容仍落库）
+			eventContent := toolContent
+			if r := []rune(eventContent); len(r) > 2000 {
+				eventContent = string(r[:2000]) + "…"
+			}
+			sse.event("tool_end", gin.H{"id": tc.ID, "name": tc.Function.Name, "ok": ok, "summary": summary, "result": eventContent})
 
 			pendingMsgs = append(pendingMsgs, models.Message{
 				ID:             snowflake.Next(),

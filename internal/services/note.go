@@ -246,13 +246,11 @@ func SearchNotesForAI(keywords, tags, entities []string, limit int) ([]models.No
 	where := strings.Join(conds, " OR ")
 	weightExpr := strings.Join(weightParts, " + ")
 
-	// Select 的占位参数在前，Where 的占位参数在后
-	args := append(append([]any{}, weightArgs...), condArgs...)
-
+	// Select 与 Where 各自的占位参数分开传，GORM 按子句构建顺序绑定
 	var notes []models.Note
 	err := database.DB.Model(&models.Note{}).
-		Select("notes.*, ("+weightExpr+") AS relevance").
-		Where("is_active = 1 AND ("+where+")", args...).
+		Select("notes.*, ("+weightExpr+") AS relevance", weightArgs...).
+		Where("is_active = 1 AND ("+where+")", condArgs...).
 		Order("relevance DESC, updated_at DESC").
 		Limit(limit).
 		Find(&notes).Error

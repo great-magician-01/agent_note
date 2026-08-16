@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import MarkdownIt from 'markdown-it'
-import { useChatStore } from '../stores/chat'
+import { buildViewItems, toolLabel, useChatStore } from '../stores/chat'
 import { useAIConfigStore } from '../stores/aiConfigs'
 
 const props = defineProps<{
@@ -27,8 +27,33 @@ const input = ref('')
 const listEl = ref<HTMLElement>()
 const showDrawer = ref(false)
 
+// 消息列表 → 视图项（思考 / 正文 / 工具调用，按模型输出顺序）
+const viewItems = computed(() => buildViewItems(chat.messages))
+
+// 展开状态：思考/工具块默认折叠；思考流式期间自动展开
+const expandedKeys = ref(new Set<string>())
+function isExpanded(key: string, streaming?: boolean): boolean {
+  return !!streaming || expandedKeys.value.has(key)
+}
+function toggleExpand(key: string) {
+  const s = new Set(expandedKeys.value)
+  if (s.has(key)) s.delete(key)
+  else s.add(key)
+  expandedKeys.value = s
+}
+
 function renderMd(text: string): string {
   return md.render(text)
+}
+
+// 工具结果/参数展示：尝试 JSON 美化
+function prettyText(raw?: string): string {
+  if (!raw) return ''
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2)
+  } catch {
+    return raw
+  }
 }
 
 async function scrollToBottom() {
@@ -37,7 +62,11 @@ async function scrollToBottom() {
 }
 
 watch(
-  () => chat.messages.length && chat.messages[chat.messages.length - 1]?.content,
+  () => {
+    const items = viewItems.value
+    const last = items[items.length - 1]
+    return `${items.length}|${last?.content.length ?? 0}`
+  },
   () => scrollToBottom(),
 )
 
@@ -84,6 +113,9 @@ watch(
     }
   },
 )
+
+// 离开页面时中断在飞消息（后端随连接断开取消上游请求）
+onUnmounted(() => chat.stop())
 </script>
 
 <template>
@@ -177,35 +209,74 @@ watch(
           </div>
         </div>
 
-        <template v-for="msg in chat.messages" :key="msg.id">
+        <template v-for="item in viewItems" :key="item.key">
           <!-- 用户气泡 -->
-          <div v-if="msg.role === 'user'" class="flex justify-end">
+          <div v-if="item.kind === 'user'" class="flex justify-end">
             <div
               class="max-w-[85%] px-3.5 py-2.5 rounded-[14px] rounded-br-[4px] text-[13px] leading-relaxed text-white bg-gradient-to-br from-[var(--user-blue)] to-[var(--user-blue-deep)] whitespace-pre-wrap break-words"
-            >{{ msg.content }}</div>
+            >{{ item.content }}</div>
           </div>
 
-          <!-- 工具状态行 -->
-          <div
-            v-else-if="msg.role === 'tool'"
-            class="flex items-center gap-2 px-1 text-[12px] text-[var(--text-2)]"
-          >
-            <span v-if="msg.streaming" class="pulse-dot" />
-            <span
-              v-else
-              class="w-2 h-2 rounded-full"
-              :class="msg.toolOk ? 'bg-[var(--success)]' : 'bg-[var(--danger)]'"
-            />
-            <span :class="{ 'text-[var(--danger)]': msg.toolOk === false }">{{ msg.toolSummary }}</span>
+          <!-- 思考块（默认折叠，流式期间自动展开） -->
+          <div v-else-if="item.kind === 'think'" class="rounded-[10px] border border-[var(--glass-border)] bg-[var(--glass-1)] overflow-hidden">
+            <button
+              type="button"
+              class="w-full flex items-center gap-2 px-3 py-2 text-[12px] text-[var(--text-2)] hover:text-[var(--text-1)] transition-colors"
+              @click="toggleExpand(item.key)"
+            >
+              <span v-if="item.streaming" class="pulse-dot" />
+              <span v-else class="text-[var(--aurora-violet)]">✦</span>
+              <span class="font-medium">思考过程</span>
+              <span
+                class="ml-auto text-[10px] text-[var(--text-3)] transition-transform duration-150"
+                :class="isExpanded(item.key, item.streaming) ? 'rotate-180' : ''"
+              >▾</span>
+            </button>
+            <div
+              v-if="isExpanded(item.key, item.streaming)"
+              class="px-3 pb-2.5 text-[12px] leading-relaxed text-[var(--text-3)] whitespace-pre-wrap break-words max-h-[240px] overflow-y-auto think-body"
+            >{{ item.content }}<span v-if="item.streaming" class="inline-block w-1.5 h-3.5 ml-0.5 align-middle bg-[var(--aurora-violet)] animate-pulse" /></div>
           </div>
 
-          <!-- AI 气泡 -->
+          <!-- 工具调用块（默认折叠，可展开看参数/结果） -->
+          <div v-else-if="item.kind === 'tool'" class="rounded-[10px] border border-[var(--glass-border)] bg-[var(--glass-1)] overflow-hidden">
+            <button
+              type="button"
+              class="w-full flex items-center gap-2 px-3 py-2 text-[12px] transition-colors"
+              @click="toggleExpand(item.key)"
+            >
+              <span v-if="item.streaming" class="pulse-dot" />
+              <span
+                v-else
+                class="w-2 h-2 rounded-full shrink-0"
+                :class="item.ok ? 'bg-[var(--success)]' : 'bg-[var(--danger)]'"
+              />
+              <span class="font-medium text-[var(--text-2)]">🔧 {{ toolLabel(item.name) }}</span>
+              <span class="truncate text-[var(--text-3)]" :class="{ 'text-[var(--danger)]': item.ok === false }">{{ item.summary }}</span>
+              <span
+                class="ml-auto text-[10px] text-[var(--text-3)] transition-transform duration-150 shrink-0"
+                :class="isExpanded(item.key) ? 'rotate-180' : ''"
+              >▾</span>
+            </button>
+            <div v-if="isExpanded(item.key)" class="px-3 pb-2.5 space-y-2">
+              <div v-if="item.input">
+                <div class="text-[11px] text-[var(--text-3)] mb-1">参数</div>
+                <pre class="tool-detail">{{ item.input }}</pre>
+              </div>
+              <div v-if="item.result">
+                <div class="text-[11px] text-[var(--text-3)] mb-1">结果</div>
+                <pre class="tool-detail">{{ prettyText(item.result) }}</pre>
+              </div>
+            </div>
+          </div>
+
+          <!-- AI 正文气泡 -->
           <div v-else class="flex justify-start">
             <div
               class="max-w-[92%] px-3.5 py-2.5 rounded-[14px] rounded-bl-[4px] glass-2 text-[13px] leading-relaxed break-words chat-md"
             >
-              <div v-if="msg.content" v-html="renderMd(msg.content)" />
-              <span v-if="msg.streaming" class="inline-block w-2 h-4 ml-0.5 align-middle bg-[var(--accent)] animate-pulse" />
+              <div v-if="item.content" v-html="renderMd(item.content)" />
+              <span v-if="item.streaming" class="inline-block w-2 h-4 ml-0.5 align-middle bg-[var(--accent)] animate-pulse" />
             </div>
           </div>
         </template>
@@ -222,13 +293,21 @@ watch(
             @keydown="onKeydown"
           />
           <button
+            v-if="chat.sending"
+            class="w-9 h-9 rounded-full flex items-center justify-center text-[var(--danger)] bg-[var(--glass-3)] hover:bg-[var(--glass-border-strong)] transition-all shrink-0"
+            title="停止生成"
+            @click="chat.stop()"
+          >
+            <span class="text-[11px]">■</span>
+          </button>
+          <button
+            v-else
             class="w-9 h-9 rounded-full flex items-center justify-center text-white bg-gradient-to-br from-[var(--accent)] to-[var(--accent-deep)] hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed transition-all shrink-0"
-            :disabled="!input.trim() || chat.sending"
+            :disabled="!input.trim()"
             title="发送"
             @click="send"
           >
-            <span v-if="chat.sending" class="pulse-dot !bg-white" />
-            <span v-else>↑</span>
+            <span>↑</span>
           </button>
         </div>
       </div>
@@ -266,5 +345,25 @@ watch(
   padding-left: 10px;
   color: var(--text-2);
   margin: 0.4em 0;
+}
+/* 工具调用展开详情 */
+.tool-detail {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--text-2);
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  max-height: 200px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.think-body::-webkit-scrollbar,
+.tool-detail::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
 }
 </style>

@@ -9,8 +9,10 @@ export interface ChatMessage {
   tool_calls?: string
   tool_call_id?: string
   name?: string
+  reasoning?: string | null
   // 前端附加状态
-  streaming?: boolean
+  streaming?: boolean // assistant 正文仍在流入
+  thinkStreaming?: boolean // 思考仍在流入
   toolSummary?: string
   toolOk?: boolean
   toolInput?: unknown
@@ -22,6 +24,148 @@ export interface Conversation {
   title: string
   updated_at: string
 }
+
+// ---- 消息 → 视图项（思考 / 正文 / 工具调用，按模型输出顺序） ----
+
+export interface ChatViewItem {
+  key: string
+  kind: 'user' | 'think' | 'text' | 'tool'
+  content: string
+  streaming?: boolean
+  // tool 项
+  name?: string
+  input?: string
+  ok?: boolean
+  summary?: string
+  result?: string
+}
+
+const TOOL_LABELS: Record<string, string> = {
+  search_notes: '搜索笔记',
+  get_note: '读取笔记',
+  list_categories: '获取分类',
+  replace_note_section: '修改笔记',
+  append_note_content: '追加内容',
+  update_note_title: '修改标题',
+  create_note: '创建笔记',
+}
+
+export function toolLabel(name?: string): string {
+  return (name && TOOL_LABELS[name]) || name || '工具'
+}
+
+export function toolPendingText(name: string): string {
+  return `正在${toolLabel(name)}…`
+}
+
+// 从落库的 tool 消息内容推导 状态+摘要（与后端 toolSummary 对齐）
+export function summarizeToolContent(name: string | undefined, content: string): { ok: boolean; summary: string } {
+  let parsed: any = null
+  try {
+    parsed = JSON.parse(content)
+  } catch {
+    /* 非 JSON 内容 */
+  }
+  if (parsed && typeof parsed.error === 'string') return { ok: false, summary: parsed.error }
+  switch (name) {
+    case 'search_notes':
+      return { ok: true, summary: `找到 ${parsed?.total ?? '?'} 条笔记` }
+    case 'get_note':
+      return { ok: true, summary: '已读取笔记全文' }
+    case 'list_categories':
+      return { ok: true, summary: '已获取分类列表' }
+    case 'replace_note_section':
+      return { ok: true, summary: '已替换笔记内容' }
+    case 'append_note_content':
+      return { ok: true, summary: '已追加内容到笔记' }
+    case 'update_note_title':
+      return { ok: true, summary: '已修改笔记标题' }
+    case 'create_note':
+      return { ok: true, summary: '已创建新笔记' }
+    default:
+      return { ok: true, summary: '工具执行完成' }
+  }
+}
+
+function prettyJSON(raw: string | undefined): string {
+  if (!raw) return ''
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2)
+  } catch {
+    return raw
+  }
+}
+
+function toolView(key: string, name: string | undefined, tm: ChatMessage | undefined, input?: string): ChatViewItem {
+  const derived = tm ? summarizeToolContent(name, tm.content) : { ok: true, summary: '结果缺失' }
+  return {
+    key,
+    kind: 'tool',
+    content: '',
+    name,
+    input,
+    ok: tm?.toolOk ?? derived.ok,
+    summary: tm?.toolSummary ?? derived.summary,
+    result: tm?.content,
+    streaming: tm?.streaming ?? false,
+  }
+}
+
+// 把扁平消息列表转换为按序展示的视图项：
+// 每条 assistant 消息依次展开为 思考（可折叠）→ 正文气泡 → 工具调用块（结果按序消费紧随的 tool 消息）
+export function buildViewItems(messages: ChatMessage[]): ChatViewItem[] {
+  const items: ChatViewItem[] = []
+  let i = 0
+  while (i < messages.length) {
+    const m = messages[i]
+
+    if (m.role === 'user') {
+      items.push({ key: m.id, kind: 'user', content: m.content })
+      i++
+      continue
+    }
+
+    if (m.role === 'assistant') {
+      if (m.reasoning) {
+        items.push({ key: `${m.id}-think`, kind: 'think', content: m.reasoning, streaming: m.thinkStreaming })
+      }
+      // 有正文，或正在等待本轮首个 token（占位光标）
+      const textStreaming = !!m.streaming && !m.tool_calls
+      if (m.content || textStreaming) {
+        items.push({ key: `${m.id}-text`, kind: 'text', content: m.content, streaming: textStreaming })
+      }
+      if (m.tool_calls) {
+        let tcs: any[] = []
+        try {
+          tcs = JSON.parse(m.tool_calls)
+        } catch {
+          tcs = []
+        }
+        tcs.forEach((tc, idx) => {
+          const name: string | undefined = tc.function?.name
+          // 顺序消费紧随其后的 tool 消息（tool_call_id 对得上才消费，错位时兜底展示孤儿消息）
+          let tm: ChatMessage | undefined
+          const next = messages[i + 1]
+          if (next && next.role === 'tool' && (!next.tool_call_id || !tc.id || next.tool_call_id === tc.id)) {
+            tm = next
+            i++
+          }
+          items.push(toolView(`${m.id}-tc-${tc.id || idx}`, name, tm, prettyJSON(tc.function?.arguments)))
+        })
+      }
+      i++
+      continue
+    }
+
+    // 孤儿 tool 消息（前置 assistant 缺失等异常情况）
+    items.push(toolView(m.id, m.name, m, m.toolInput ? prettyJSON(JSON.stringify(m.toolInput)) : undefined))
+    i++
+  }
+  return items
+}
+
+// 在飞请求的中断控制器（同一时间只有一个发送中请求，模块级即可）
+let abortCtrl: AbortController | null = null
 
 // 每个面板（global / note:<id>）一份独立聊天状态
 export const useChatStore = defineStore('chat', {
@@ -35,8 +179,15 @@ export const useChatStore = defineStore('chat', {
     lastUpdatedNoteId: '' as string,
   }),
   actions: {
+    // 中断在飞的消息（停止按钮 / 切换会话 / 卸载面板时调用）；
+    // fetch 断开后后端请求 ctx 取消，上游 AI 请求随之断开
+    stop() {
+      abortCtrl?.abort()
+    },
+
     // 切换作用域（进入首页 / 编辑页时调用）
     async switchScope(noteId: string) {
+      this.stop()
       this.scopeNoteId = noteId
       this.currentId = ''
       this.messages = []
@@ -55,22 +206,20 @@ export const useChatStore = defineStore('chat', {
     },
 
     async select(convId: string) {
+      this.stop()
       this.currentId = convId
       const { data } = await api.get(`/conversations/${convId}/messages`)
-      // tool 消息折叠为摘要行展示
-      this.messages = (data || []).map((m: any) => ({
-        ...m,
-        toolSummary: m.role === 'tool' ? '工具调用结果' : undefined,
-        toolOk: true,
-      }))
+      this.messages = data || []
     },
 
     async newConversation() {
+      this.stop()
       this.currentId = ''
       this.messages = []
     },
 
     async removeConversation(convId: string) {
+      this.stop()
       await api.post('/conversations/delete', { id: convId })
       if (this.currentId === convId) {
         this.currentId = ''
@@ -89,20 +238,41 @@ export const useChatStore = defineStore('chat', {
         role: 'user',
         content: content.trim(),
       })
-      // 插入流式 assistant 占位
-      const assistantMsg: ChatMessage = {
-        id: `tmp-a-${Date.now()}`,
-        role: 'assistant',
-        content: '',
-        streaming: true,
+
+      // 当前轮次的 assistant 消息：每轮（思考+正文+工具调用）一条，与落库结构一致；
+      // 工具调用开始时收尾本轮，下一轮首个 think/delta 再新建
+      let cur: ChatMessage | null = null
+      let lastAssistant: ChatMessage | null = null
+      let tmpSeq = 0
+      const ensureAssistant = (): ChatMessage => {
+        if (!cur) {
+          cur = {
+            id: `tmp-a-${Date.now()}-${tmpSeq++}`,
+            role: 'assistant',
+            content: '',
+            streaming: true,
+          }
+          this.messages.push(cur)
+          lastAssistant = cur
+        }
+        return cur
       }
-      this.messages.push(assistantMsg)
+      const finalizeRound = () => {
+        if (cur) {
+          cur.streaming = false
+          cur.thinkStreaming = false
+          cur = null
+        }
+      }
+      ensureAssistant() // 立即出现输入中光标
 
       const body: Parameters<typeof postChatSSE>[0] = { content: content.trim() }
       if (this.currentId) body.conversation_id = this.currentId
       else if (this.scopeNoteId) body.note_id = this.scopeNoteId
 
       let errored = false
+      const ctrl = new AbortController()
+      abortCtrl = ctrl
 
       try {
         await postChatSSE(body, {
@@ -113,32 +283,57 @@ export const useChatStore = defineStore('chat', {
               this.fetchConversations()
             }
           },
+          onThink: (d) => {
+            const a = ensureAssistant()
+            a.thinkStreaming = true
+            a.reasoning = (a.reasoning || '') + d.content
+          },
           onDelta: (d) => {
-            assistantMsg.content += d.content
+            const a = ensureAssistant()
+            a.thinkStreaming = false // 正文开始 = 思考结束
+            a.content += d.content
           },
           onToolStart: (d) => {
-            // 在 assistant 消息前插入工具状态行
-            const toolMsg: ChatMessage = {
-              id: `tool-${Date.now()}-${Math.random()}`,
+            // 工具调用记录挂到本轮 assistant 消息上（与落库的 tool_calls 结构一致）
+            const a = ensureAssistant()
+            a.thinkStreaming = false
+            let tcs: any[] = []
+            try {
+              tcs = a.tool_calls ? JSON.parse(a.tool_calls) : []
+            } catch {
+              tcs = []
+            }
+            tcs.push({
+              id: d.id,
+              type: 'function',
+              function: {
+                name: d.name,
+                arguments: typeof d.input === 'string' ? d.input : JSON.stringify(d.input ?? {}),
+              },
+            })
+            a.tool_calls = JSON.stringify(tcs)
+            finalizeRound()
+
+            this.messages.push({
+              id: `tool-${d.id || Date.now()}`,
               role: 'tool',
               content: '',
+              tool_call_id: d.id,
               name: d.name,
               toolInput: d.input,
               toolSummary: toolPendingText(d.name),
               streaming: true,
-            }
-            // 插入到 assistant 占位之前
-            const idx = this.messages.indexOf(assistantMsg)
-            this.messages.splice(idx, 0, toolMsg)
+            })
           },
           onToolEnd: (d) => {
-            // 找到最后一个该名字的进行中工具消息
+            // 由后往前找到对应的进行中工具消息
             for (let i = this.messages.length - 1; i >= 0; i--) {
               const m = this.messages[i]
-              if (m.role === 'tool' && m.name === d.name && m.streaming) {
+              if (m.role === 'tool' && m.streaming && (d.id ? m.tool_call_id === d.id : m.name === d.name)) {
                 m.streaming = false
                 m.toolOk = d.ok
                 m.toolSummary = d.summary
+                m.content = d.result || ''
                 break
               }
             }
@@ -148,40 +343,37 @@ export const useChatStore = defineStore('chat', {
             this.noteUpdatedFlag++
           },
           onDone: () => {
-            assistantMsg.streaming = false
+            finalizeRound()
             this.fetchConversations() // 更新会话排序/标题
           },
           onError: (d) => {
             errored = true
-            assistantMsg.streaming = false
-            assistantMsg.content = assistantMsg.content
-              ? assistantMsg.content + `\n\n⚠ ${d.message}`
-              : `⚠ ${d.message}`
+            const a = ensureAssistant()
+            a.streaming = false
+            a.thinkStreaming = false
+            a.content = a.content ? a.content + `\n\n⚠ ${d.message}` : `⚠ ${d.message}`
           },
-        })
+        }, ctrl.signal)
       } catch (e: any) {
-        errored = true
-        assistantMsg.streaming = false
-        assistantMsg.content = `⚠ 网络错误：${e.message || '连接中断'}`
+        if (e?.name === 'AbortError') {
+          // 用户主动中断：保留已生成内容，不追加错误提示（后端会把部分输出落库）
+        } else {
+          errored = true
+          const a = ensureAssistant()
+          a.streaming = false
+          a.thinkStreaming = false
+          a.content = `⚠ 网络错误：${e.message || '连接中断'}`
+        }
       } finally {
         this.sending = false
-        if (errored && !assistantMsg.content) {
-          assistantMsg.content = '⚠ 对话出错，请重试'
+        if (abortCtrl === ctrl) abortCtrl = null
+        finalizeRound()
+        // TS 无法跟踪闭包内赋值，这里显式断言
+        const last = lastAssistant as ChatMessage | null
+        if (errored && last && !last.content) {
+          last.content = '⚠ 对话出错，请重试'
         }
       }
     },
   },
 })
-
-function toolPendingText(name: string): string {
-  switch (name) {
-    case 'search_notes': return '正在搜索笔记…'
-    case 'get_note': return '正在读取笔记…'
-    case 'list_categories': return '正在获取分类…'
-    case 'replace_note_section': return '正在修改笔记…'
-    case 'append_note_content': return '正在追加内容…'
-    case 'update_note_title': return '正在修改标题…'
-    case 'create_note': return '正在创建笔记…'
-    default: return `正在执行 ${name}…`
-  }
-}

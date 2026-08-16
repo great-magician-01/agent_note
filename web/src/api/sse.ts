@@ -3,8 +3,9 @@
 export interface SSEHandlers {
   onMeta?: (data: { conversation_id: string; user_message_id: string }) => void
   onDelta?: (data: { content: string }) => void
-  onToolStart?: (data: { name: string; input: unknown }) => void
-  onToolEnd?: (data: { name: string; ok: boolean; summary: string }) => void
+  onThink?: (data: { content: string }) => void
+  onToolStart?: (data: { id: string; name: string; input: unknown }) => void
+  onToolEnd?: (data: { id: string; name: string; ok: boolean; summary: string; result?: string }) => void
   onNoteUpdated?: (data: { note_id: string }) => void
   onDone?: (data: { conversation_id: string }) => void
   onError?: (data: { message: string }) => void
@@ -16,7 +17,7 @@ export interface ChatRequest {
   content: string
 }
 
-export async function postChatSSE(body: ChatRequest, handlers: SSEHandlers): Promise<void> {
+export async function postChatSSE(body: ChatRequest, handlers: SSEHandlers, signal?: AbortSignal): Promise<void> {
   const token = localStorage.getItem('token')
   const resp = await fetch('/api/chat', {
     method: 'POST',
@@ -25,6 +26,7 @@ export async function postChatSSE(body: ChatRequest, handlers: SSEHandlers): Pro
       Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify(body),
+    signal,
   })
 
   if (!resp.ok) {
@@ -57,6 +59,7 @@ export async function postChatSSE(body: ChatRequest, handlers: SSEHandlers): Pro
     switch (event) {
       case 'meta': handlers.onMeta?.(data); break
       case 'delta': handlers.onDelta?.(data); break
+      case 'think': handlers.onThink?.(data); break
       case 'tool_start': handlers.onToolStart?.(data); break
       case 'tool_end': handlers.onToolEnd?.(data); break
       case 'note_updated': handlers.onNoteUpdated?.(data); break

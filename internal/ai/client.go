@@ -73,8 +73,10 @@ type chatRequest struct {
 
 type streamChoice struct {
 	Delta struct {
-		Content   string          `json:"content"`
-		ToolCalls []toolCallChunk `json:"tool_calls"`
+		Content string `json:"content"`
+		// 推理模型的思考增量（DeepSeek reasoner 等）
+		ReasoningContent string          `json:"reasoning_content"`
+		ToolCalls        []toolCallChunk `json:"tool_calls"`
 	} `json:"delta"`
 	FinishReason *string `json:"finish_reason"`
 }
@@ -99,12 +101,14 @@ type streamResponse struct {
 // StreamResult 一轮流式调用的聚合结果
 type StreamResult struct {
 	Content   string
+	Reasoning string // 思考内容（推理模型，可能为空）
 	ToolCalls []ToolCall
 }
 
-// ChatStream 发起流式 chat 请求；onDelta 回调文本增量。
+// ChatStream 发起流式 chat 请求；onDelta 回调正文增量，onThink 回调思考增量（均可为 nil）。
 // 返回聚合后的完整内容与工具调用（若有）。
-func (c *Client) ChatStream(ctx context.Context, messages []Message, tools []Tool, onDelta func(string)) (*StreamResult, error) {
+// 注意：流中途出错（含 ctx 取消）时返回的 result 携带已聚合的部分内容，err 非 nil。
+func (c *Client) ChatStream(ctx context.Context, messages []Message, tools []Tool, onDelta func(string), onThink func(string)) (*StreamResult, error) {
 	body := chatRequest{
 		Model:    c.Model,
 		Messages: messages,
@@ -157,13 +161,19 @@ func (c *Client) ChatStream(ctx context.Context, messages []Message, tools []Too
 			continue
 		}
 		if chunk.Error != nil {
-			return nil, fmt.Errorf("AI 服务错误: %s", chunk.Error.Message)
+			return result, fmt.Errorf("AI 服务错误: %s", chunk.Error.Message)
 		}
 		if len(chunk.Choices) == 0 {
 			continue
 		}
 
 		delta := chunk.Choices[0].Delta
+		if delta.ReasoningContent != "" {
+			result.Reasoning += delta.ReasoningContent
+			if onThink != nil {
+				onThink(delta.ReasoningContent)
+			}
+		}
 		if delta.Content != "" {
 			result.Content += delta.Content
 			if onDelta != nil {
@@ -186,7 +196,8 @@ func (c *Client) ChatStream(ctx context.Context, messages []Message, tools []Too
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("读取 AI 流失败: %w", err)
+		// 返回已聚合的部分结果（调用方对 context.Canceled 等中断场景可能想保留部分输出）
+		return result, fmt.Errorf("读取 AI 流失败: %w", err)
 	}
 
 	// 按 index 顺序输出工具调用
