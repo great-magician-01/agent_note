@@ -1,0 +1,57 @@
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/bookshelf
+/bin/
+
+# Go workspace
+go.work
+go.work.sum
+
+# Test coverage
+coverage.out
+coverage.html
+*.coverprofile
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Uploads
+uploads/
+
+# Node
+node_modules
+dist
+dist-ssr
+*.local
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS
+Thumbs.db
+Desktop.ini

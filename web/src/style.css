@@ -1,0 +1,287 @@
+@import "tailwindcss";
+
+/* ============ 设计令牌（见 docs/frontend-design.md §2） ============ */
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+:root {
+  /* 字体 */
+  --font-sans: Inter, -apple-system, "PingFang SC", "HarmonyOS Sans SC",
+    "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --font-serif-note: "LXGW WenKai Screen", "Songti SC", serif;
+  --font-mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+
+  /* 实体光谱 */
+  --entity-person: #a78bfa;
+  --entity-organization: #38bdf8;
+  --entity-location: #34d399;
+  --entity-technology: #2dd4bf;
+  --entity-product: #fbbf24;
+  --entity-event: #fb7185;
+  --entity-other: #94a3b8;
+
+  /* 状态色 */
+  --success: #34d399;
+  --warning: #fbbf24;
+  --danger: #f87171;
+
+  /* 动效 */
+  --ease-standard: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* 深色主题「夜墨」（默认） */
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+  --ink: #0b1022;
+  --aurora-teal: #2dd4bf;
+  --aurora-violet: #a78bfa;
+  --aurora-rose: #fb7185;
+  --accent: #2dd4bf;
+  --accent-deep: #0d9488;
+  --user-blue: #818cf8;
+  --user-blue-deep: #6366f1;
+
+  --text-1: rgba(255, 255, 255, 0.93);
+  --text-2: rgba(255, 255, 255, 0.62);
+  --text-3: rgba(255, 255, 255, 0.38);
+
+  --glass-1: rgba(255, 255, 255, 0.05);
+  --glass-2: rgba(255, 255, 255, 0.08);
+  --glass-3: rgba(255, 255, 255, 0.12);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-border-strong: rgba(255, 255, 255, 0.18);
+  --glass-top-light: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  --shadow-glass: 0 8px 32px rgba(0, 0, 0, 0.35);
+}
+
+/* 浅色主题「晨雾」 */
+[data-theme="light"] {
+  color-scheme: light;
+  --ink: #edf1f7;
+  --aurora-teal: #2dd4bf;
+  --aurora-violet: #a78bfa;
+  --aurora-rose: #fb7185;
+  --accent: #0d9488;
+  --accent-deep: #0f766e;
+  --user-blue: #6366f1;
+  --user-blue-deep: #4f46e5;
+
+  --text-1: rgba(15, 23, 42, 0.92);
+  --text-2: rgba(15, 23, 42, 0.6);
+  --text-3: rgba(15, 23, 42, 0.4);
+
+  --glass-1: rgba(255, 255, 255, 0.5);
+  --glass-2: rgba(255, 255, 255, 0.6);
+  --glass-3: rgba(255, 255, 255, 0.75);
+  --glass-border: rgba(15, 23, 42, 0.07);
+  --glass-border-strong: rgba(15, 23, 42, 0.16);
+  --glass-top-light: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+  --shadow-glass: 0 8px 24px rgba(15, 23, 42, 0.1);
+}
+
+/* ============ 全局基础 ============ */
+
+* {
+  border-color: var(--glass-border);
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  color: var(--text-1);
+  background: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden; /* 应用内自滚动 */
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+/* 滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--glass-3);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--glass-border-strong);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 焦点环 */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ============ 玻璃组件基类 ============ */
+
+.glass {
+  background: var(--glass-1);
+  backdrop-filter: blur(24px) saturate(160%);
+  -webkit-backdrop-filter: blur(24px) saturate(160%);
+  border: 1px solid var(--glass-border);
+  box-shadow:
+    var(--glass-top-light),
+    var(--shadow-glass);
+}
+
+.glass-2 {
+  background: var(--glass-2);
+  backdrop-filter: blur(24px) saturate(160%);
+  -webkit-backdrop-filter: blur(24px) saturate(160%);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-top-light);
+}
+
+.glass-3 {
+  background: var(--glass-3);
+  backdrop-filter: blur(24px) saturate(160%);
+  -webkit-backdrop-filter: blur(24px) saturate(160%);
+  border: 1px solid var(--glass-border-strong);
+}
+
+/* ============ 背景极光 ============ */
+
+.aurora-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  background: var(--ink);
+}
+
+.aurora-bg::after {
+  /* 细噪点 */
+  content: "";
+  position: absolute;
+  inset: 0;
+  opacity: 0.025;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+.aurora-blob {
+  position: absolute;
+  width: 55vmax;
+  height: 55vmax;
+  border-radius: 50%;
+  filter: blur(120px);
+  opacity: 0.16;
+  will-change: transform;
+}
+[data-theme="light"] .aurora-blob {
+  opacity: 0.1;
+}
+
+.aurora-blob-1 {
+  background: var(--aurora-teal);
+  top: -18%;
+  left: -12%;
+  animation: drift-1 60s ease-in-out infinite alternate;
+}
+.aurora-blob-2 {
+  background: var(--aurora-violet);
+  bottom: -22%;
+  right: -10%;
+  animation: drift-2 72s ease-in-out infinite alternate;
+}
+.aurora-blob-3 {
+  background: var(--aurora-rose);
+  top: 30%;
+  left: 45%;
+  width: 35vmax;
+  height: 35vmax;
+  opacity: 0.07;
+  animation: drift-3 84s ease-in-out infinite alternate;
+}
+
+@keyframes drift-1 {
+  to {
+    transform: translate(12vw, 10vh) rotate(40deg) scale(1.15);
+  }
+}
+@keyframes drift-2 {
+  to {
+    transform: translate(-10vw, -12vh) rotate(-30deg) scale(1.1);
+  }
+}
+@keyframes drift-3 {
+  to {
+    transform: translate(-14vw, 8vh) rotate(25deg) scale(0.9);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .aurora-blob {
+    animation: none;
+  }
+  * {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
+
+/* ============ 载入编排（唯一编排时刻） ============ */
+
+.reveal {
+  opacity: 0;
+  transform: translateY(10px);
+  animation: reveal-in 240ms var(--ease-standard) forwards;
+}
+.reveal-1 { animation-delay: 0ms; }
+.reveal-2 { animation-delay: 60ms; }
+.reveal-3 { animation-delay: 120ms; }
+.reveal-4 { animation-delay: 180ms; }
+
+@keyframes reveal-in {
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ============ 呼吸点（AI 存在 / pending 状态） ============ */
+
+.pulse-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse-breathe 1.6s ease-in-out infinite;
+}
+
+@keyframes pulse-breathe {
+  0%,
+  100% {
+    opacity: 0.4;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.15);
+  }
+}
+
+/* 通用过渡 */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 160ms var(--ease-standard);
+}
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}

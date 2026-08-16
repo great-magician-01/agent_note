@@ -1,0 +1,19 @@
+# 版本控制 / 环境
+.git
+.env
+.env.*
+!.env.example
+
+# 前端
+web/node_modules
+web/dist
+
+# 运行时产物
+logs
+uploads
+
+# 文档与编辑器
+docs
+*.md
+.vscode
+.idea

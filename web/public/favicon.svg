@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <!-- 夜墨底：上方微亮 -->
+    <linearGradient id="ink" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#151C3A"/>
+      <stop offset="1" stop-color="#0B1022"/>
+    </linearGradient>
+    <!-- 极光：teal → violet -->
+    <linearGradient id="aurora" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#A78BFA"/>
+    </linearGradient>
+    <!-- 中心 AI 呼吸点 -->
+    <radialGradient id="core" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.55" stop-color="#99F6E4"/>
+      <stop offset="1" stop-color="#2DD4BF"/>
+    </radialGradient>
+    <!-- 菱形柔光 -->
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="3.2" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- 玻璃底板 -->
+  <rect width="64" height="64" rx="15" fill="url(#ink)"/>
+  <!-- 顶部受光（全局签名） -->
+  <rect x="1" y="1" width="62" height="62" rx="14" fill="none" stroke="#FFFFFF" stroke-opacity="0.10"/>
+  <path d="M6 15 Q6 6 15 6 L49 6 Q58 6 58 15" fill="none" stroke="#FFFFFF" stroke-opacity="0.28" stroke-width="1.6" stroke-linecap="round"/>
+
+  <!-- ◈ 菱形（极光渐变 + 柔光） -->
+  <g filter="url(#glow)">
+    <path d="M32 13 L51 32 L32 51 L13 32 Z" fill="url(#aurora)"/>
+  </g>
+  <!-- 菱形内切面（顶部受光） -->
+  <path d="M32 13 L51 32 L32 32 Z" fill="#FFFFFF" fill-opacity="0.22"/>
+  <!-- 内菱形镂空 -->
+  <path d="M32 23.5 L40.5 32 L32 40.5 L23.5 32 Z" fill="#0B1022" fill-opacity="0.85"/>
+  <!-- AI 呼吸核心 -->
+  <circle cx="32" cy="32" r="4.2" fill="url(#core)"/>
+</svg>
