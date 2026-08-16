@@ -205,12 +205,30 @@ CREATE TABLE messages (
   role            VARCHAR(16) NOT NULL,          -- user | assistant | tool
   content         TEXT NOT NULL DEFAULT '',
   tool_calls      JSONB,                         -- assistant 消息的工具调用（原样回放）
+  reasoning       TEXT,                          -- assistant 思考内容（推理模型）
+  usage           JSONB,                         -- assistant 该轮 token 用量（归一化：输入/输出/合计/缓存命中/思考）
   tool_call_id    VARCHAR(64),                   -- tool 消息归属
   name            VARCHAR(64),                   -- tool 消息的工具名
   is_active       INT NOT NULL DEFAULT 1,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_messages_conv ON messages(conversation_id, is_active, id);
+
+-- AI 调用记录（非会话类调用，如元数据提取；会话类调用的用量随 messages.usage 落库）
+CREATE TABLE ai_call_logs (
+  id          BIGINT PRIMARY KEY,      -- 雪花 ID
+  kind        VARCHAR(32) NOT NULL,          -- 调用类型：meta_extract 等
+  note_id     BIGINT,                        -- 关联笔记（元数据提取）
+  model       VARCHAR(128) NOT NULL DEFAULT '',
+  attempt     INT NOT NULL DEFAULT 1,        -- 同一任务内的重试序号
+  usage       JSONB,                         -- 归一化 token 用量（输入/输出/合计/缓存命中/思考）
+  success     BOOLEAN NOT NULL DEFAULT FALSE,
+  error       TEXT NOT NULL DEFAULT '',
+  duration_ms BIGINT NOT NULL DEFAULT 0,
+  is_active   INT NOT NULL DEFAULT 1,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_ai_call_logs_kind ON ai_call_logs(kind, is_active);
 
 -- 图片上传
 CREATE TABLE uploads (
@@ -391,6 +409,30 @@ Note         = NoteListItem + { content_md, category_id: string | null, meta_err
 }
 ```
 
+```json
+{
+  "name": "list_all_notes",
+  "description": "获取笔记库中全部笔记的概览列表：标题、简介、标签、实体、创建与修改时间（不含正文）。用户想纵览全库、按时间或标签整体梳理时使用；需要正文再调 get_note。",
+  "parameters": {"type": "object", "properties": {}}
+}
+```
+
+**委派类**
+
+```json
+{
+  "name": "run_subagent",
+  "description": "委派一个子代理处理需要阅读大量笔记的长上下文任务（如全库总结、多篇笔记对比归纳）。子代理拥有独立上下文，可自行检索并通读笔记全文，完成后返回精炼结论；它只读不写。当任务需要通读多篇笔记、直接处理会让对话上下文过长时，优先使用本工具。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "task": {"type": "string", "description": "交给子代理的任务描述，需自包含（目标、范围、期望产出）"}
+    },
+    "required": ["task"]
+  }
+}
+```
+
 **写作类**（编辑页会话可用）
 
 ```json
@@ -453,7 +495,10 @@ Note         = NoteListItem + { content_md, category_id: string | null, meta_err
 
 - 工具在 Go 侧执行；执行结果作为 `tool` 消息回传模型继续循环，直到模型不再产生 tool_calls
 - 写作工具执行成功后，向 SSE 推 `note_updated` 事件；写作工具的修改同样走「保存 → 元数据重新生成」链路
-- 最大循环轮数 8 轮，超出后终止并返回错误
+- agent 循环不设固定轮数上限（超限报错是让用户为工程问题买单），收敛由工程手段保证（`internal/ai/agentloop.go`）：
+  - 停滞检测：连续 3 轮完全相同的工具调用判定为模型卡死，下一轮改为不带工具调用，强制模型基于已有信息收尾
+  - 上下文压缩：上一轮接口返回的输入 token 数超过 400K 预算时（当前主流模型上下文已达 1M，400K 以内无压力），较早的 tool 结果替换为占位说明（保留最近 4 条原文），被省略的内容模型可重新调用工具获取；服务商未返回 usage 时按字符数兜底判断
+- `run_subagent` 启动只读子代理：独立消息上下文，仅可用 search_notes / get_note / list_all_notes（`ai.SubAgentTools()`，不含写作工具与 run_subagent 自身以防递归），收敛机制与主循环相同；最终结论原样作为工具结果回传主代理；子代理的 AI 调用随主 SSE 连接的 ctx 一并取消
 
 ### 8.3 系统提示词
 
@@ -464,8 +509,10 @@ Note         = NoteListItem + { content_md, category_id: string | null, meta_err
 规则：
 1. 用户的问题涉及查找、回忆、总结过往笔记时，必须先调用 search_notes 检索，不得凭空说"你的笔记里没有"。
 2. search_notes 返回的只是简介。先根据简介判断相关性，再对相关笔记调用 get_note 读取正文后回答。
-3. 引用笔记内容时说明笔记标题。
-4. 确实没有找到相关笔记时如实告知，并说明用了什么关键词搜索。
+3. 用户想纵览全部笔记（如"我都有哪些笔记"、按时间/标签整体梳理）时，调用 list_all_notes。
+4. 需要通读多篇笔记全文的繁重任务（如全库总结、多篇笔记对比归纳），调用 run_subagent 委派子代理处理，避免大量原文挤占对话上下文。
+5. 引用笔记内容时说明笔记标题。
+6. 确实没有找到相关笔记时如实告知，并说明用了什么关键词搜索。
 ```
 
 **写作助手**（编辑页，动态注入当前笔记 id，字符串形式）
@@ -479,10 +526,24 @@ Note         = NoteListItem + { content_md, category_id: string | null, meta_err
 - update_note_title：修改标题
 - create_note：新建一篇笔记
 - search_notes / get_note：检索其他笔记作为参考资料
+- list_all_notes：查看全库笔记概览
+- run_subagent：委派子代理处理需要通读大量笔记的长上下文任务
 规则：
 1. 用户要求"写一段/改写/扩写/润色"时，直接修改笔记本身，而不是只在对话里给出文字。
 2. 使用 replace_note_section 前先调用 get_note，old_text 从原文逐字复制。
 3. 修改完成后简要说明改了什么。
+```
+
+**子代理**（run_subagent 委派，只读）
+
+```
+你是一个子任务代理，由笔记助手主代理委派，负责处理需要大量阅读笔记的长上下文任务（如全库梳理、多篇笔记归纳对比）。
+可用工具：search_notes（检索笔记）、get_note（读取笔记全文）、list_all_notes（全库概览）。
+规则：
+1. 围绕主代理交给你的任务自主规划检索与阅读，不要向主代理索取更多背景。
+2. 你只读不写：不要尝试修改或创建任何笔记。
+3. 完成后直接输出结论本身（要点、归纳、清单等），不要复述任务，不要提及"子代理"等元信息。
+4. 结论必须自包含：主代理只能看到你的最终文字，看不到你的检索过程。
 ```
 
 **元数据提取**（worker 使用，通过工具调用返回结构化结果，**不依赖提示词约束 JSON 输出**）
@@ -503,12 +564,14 @@ Note         = NoteListItem + { content_md, category_id: string | null, meta_err
 2. 服务商不支持 tool_choice（HTTP 400/422）→ 降级为仅靠提示词引导重试一次
 3. 模型最终未发起工具调用 → 返回 `ErrNoToolCall`，worker 重试，**最多 3 次**
 4. 工具参数 JSON 解析失败同样重试
+5. 每次调用（含每次重试）落一条 `ai_call_logs` 记录：model、attempt、归一化 usage（JSONB）、success、error、duration_ms；写库失败仅打日志，不影响元数据主流程
 
 ### 8.4 上下文管理
 
-- 每次请求取会话最近 **20 条** messages，按时间序组装为 OpenAI 消息数组
+- 每次请求从最新消息开始按总字数预算（6 万字符）回溯会话历史，按时间序组装为 OpenAI 消息数组；不按固定条数截断，至少保留最新一条
 - `assistant` 的 `tool_calls` 存 JSONB，回放时原样携带；`tool` 消息带 `tool_call_id`
-- 超出 20 条时截断保留最新；后续可加「历史摘要压缩」演进
+- 循环内上下文过长由 `CompactLoopMessages` 压缩较早 tool 结果处理（见 8.2 工具执行规则）
+- 流式请求带 `stream_options.include_usage`；每轮 token 用量归一化后（输入 / 输出 / 合计 / 缓存命中 / 思考）随 assistant 消息落库（`messages.usage` JSONB）；子代理累计用量写入 run_subagent 工具结果并打 `[subagent]` 日志
 - 每轮完成后将 user / assistant / tool 消息全部落库
 
 ## 9. 关键流程

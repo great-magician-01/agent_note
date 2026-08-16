@@ -43,7 +43,9 @@ export interface ChatViewItem {
 const TOOL_LABELS: Record<string, string> = {
   search_notes: '搜索笔记',
   get_note: '读取笔记',
+  list_all_notes: '获取全部笔记',
   list_categories: '获取分类',
+  run_subagent: '委派子代理',
   replace_note_section: '修改笔记',
   append_note_content: '追加内容',
   update_note_title: '修改标题',
@@ -72,6 +74,10 @@ export function summarizeToolContent(name: string | undefined, content: string):
       return { ok: true, summary: `找到 ${parsed?.total ?? '?'} 条笔记` }
     case 'get_note':
       return { ok: true, summary: '已读取笔记全文' }
+    case 'list_all_notes':
+      return { ok: true, summary: `共 ${parsed?.total ?? '?'} 条笔记` }
+    case 'run_subagent':
+      return { ok: true, summary: '子代理已完成任务' }
     case 'list_categories':
       return { ok: true, summary: '已获取分类列表' }
     case 'replace_note_section':

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/great-magician-01/agent_note/internal/ai"
@@ -18,8 +19,9 @@ import (
 )
 
 const (
-	maxAgentRounds  = 8  // agent 循环最大轮数
-	contextMessages = 20 // 上下文携带的最近消息数
+	// maxHistoryRunes 会话历史上下文的总字数预算：从最新消息开始回溯，
+	// 累计超出预算即停止（替代固定条数截断；至少保留最新一条）
+	maxHistoryRunes = 60_000
 )
 
 // SSE 事件写出助手
@@ -109,13 +111,22 @@ func Chat(c *gin.Context) {
 		"user_message_id": strconv.FormatInt(userMsg.ID, 10),
 	})
 
-	// 4. 加载上下文（最近 20 条）
+	// 4. 加载上下文：从最新开始按总字数预算回溯（不按固定条数截断）
 	var history []models.Message
 	database.DB.
 		Where("conversation_id = ? AND is_active = 1", conv.ID).
 		Order("id DESC").
-		Limit(contextMessages).
 		Find(&history)
+	kept := len(history)
+	acc := 0
+	for i := range history {
+		if i > 0 && acc > maxHistoryRunes {
+			kept = i
+			break
+		}
+		acc += utf8.RuneCountInString(history[i].Content)
+	}
+	history = history[:kept]
 	// 反转为时间正序
 	for i, j := 0, len(history)-1; i < j; i, j = i+1, j-1 {
 		history[i], history[j] = history[j], history[i]
@@ -148,7 +159,9 @@ func Chat(c *gin.Context) {
 		messages = append(messages, am)
 	}
 
-	// 5. agent 循环
+	// 5. agent 循环：不设固定轮数上限——超限报错是让用户为工程问题买单。
+	// 收敛由工程手段保证：停滞检测（连续相同工具调用 → 无工具强制收尾）
+	// + 上下文压缩（每轮开头压缩较早的工具结果，见 ai.CompactLoopMessages）。
 	client := ai.NewClient(cfg.BaseURL, cfg.APIKey, cfg.Model)
 	tools := ai.ToolsForScope(conv.NoteID != nil)
 	ctx := c.Request.Context()
@@ -163,8 +176,19 @@ func Chat(c *gin.Context) {
 		sse.event("done", gin.H{"conversation_id": strconv.FormatInt(conv.ID, 10)})
 	}
 
-	for round := 0; round < maxAgentRounds; round++ {
-		result, err := client.ChatStream(ctx, messages, tools,
+	var guard ai.LoopGuard
+	forceFinal := false   // 判定停滞后，下一轮不带工具强制模型收尾
+	lastPromptTokens := 0 // 上一轮接口返回的输入 token 数（驱动上下文压缩；0 = 尚无数据）
+
+	for {
+		messages = ai.CompactLoopMessages(messages, lastPromptTokens)
+
+		callTools := tools
+		if forceFinal {
+			callTools = nil
+		}
+
+		result, err := client.ChatStream(ctx, messages, callTools,
 			func(delta string) {
 				sse.event("delta", gin.H{"content": delta})
 			},
@@ -203,20 +227,32 @@ func Chat(c *gin.Context) {
 			return
 		}
 
+		// 记录本轮 token 用量：驱动下一轮上下文压缩，并随 assistant 消息落库
+		if result.Usage != nil {
+			lastPromptTokens = result.Usage.PromptTokens
+		}
+		var usagePtr *string
+		if result.Usage != nil {
+			raw, _ := json.Marshal(result.Usage)
+			s := string(raw)
+			usagePtr = &s
+		}
+
 		// 思考内容（推理模型）随 assistant 消息落库
 		var reasoningPtr *string
 		if result.Reasoning != "" {
 			reasoningPtr = &result.Reasoning
 		}
 
-		// 无工具调用 → 最终回复，落库 assistant 消息并结束
-		if len(result.ToolCalls) == 0 {
+		// 无工具调用（或停滞收尾轮）→ 最终回复，落库 assistant 消息并结束
+		if len(result.ToolCalls) == 0 || forceFinal {
 			pendingMsgs = append(pendingMsgs, models.Message{
 				ID:             snowflake.Next(),
 				ConversationID: conv.ID,
 				Role:           "assistant",
 				Content:        result.Content,
 				Reasoning:      reasoningPtr,
+				Usage:          usagePtr,
 			})
 			flushAndDone()
 			return
@@ -232,6 +268,7 @@ func Chat(c *gin.Context) {
 			Content:        result.Content,
 			ToolCalls:      &tcStr,
 			Reasoning:      reasoningPtr,
+			Usage:          usagePtr,
 		})
 		messages = append(messages, ai.Message{
 			Role:      "assistant",
@@ -239,10 +276,15 @@ func Chat(c *gin.Context) {
 			ToolCalls: result.ToolCalls,
 		})
 
+		// 停滞检测：连续完全相同的工具调用视为模型卡死，标记下一轮强制收尾
+		if guard.Observe(result.ToolCalls) {
+			forceFinal = true
+		}
+
 		for _, tc := range result.ToolCalls {
 			sse.event("tool_start", gin.H{"id": tc.ID, "name": tc.Function.Name, "input": json.RawMessage(tc.Function.Arguments)})
 
-			toolResult, execErr := ai.Execute(tc.Function.Name, tc.Function.Arguments)
+			toolResult, execErr := ai.Execute(ctx, tc.Function.Name, tc.Function.Arguments)
 
 			var toolContent string
 			var summary string
@@ -259,12 +301,8 @@ func Chat(c *gin.Context) {
 				summary = execErr.Error()
 			}
 
-			// 结果截断随事件下发（展开面板预览用；完整内容仍落库）
-			eventContent := toolContent
-			if r := []rune(eventContent); len(r) > 2000 {
-				eventContent = string(r[:2000]) + "…"
-			}
-			sse.event("tool_end", gin.H{"id": tc.ID, "name": tc.Function.Name, "ok": ok, "summary": summary, "result": eventContent})
+			// 完整结果随事件下发（前端展开面板自行折叠长内容）
+			sse.event("tool_end", gin.H{"id": tc.ID, "name": tc.Function.Name, "ok": ok, "summary": summary, "result": toolContent})
 
 			pendingMsgs = append(pendingMsgs, models.Message{
 				ID:             snowflake.Next(),
@@ -282,11 +320,6 @@ func Chat(c *gin.Context) {
 			})
 		}
 	}
-
-	fail(fmt.Sprintf("工具调用轮数超过上限（%d）", maxAgentRounds))
-	for i := range pendingMsgs {
-		database.DB.Create(&pendingMsgs[i])
-	}
 }
 
 // toolSummary 生成工具执行的一行摘要（前端状态行展示）
@@ -302,6 +335,16 @@ func toolSummary(name string, r *ai.ToolResult) string {
 		return "搜索完成"
 	case "get_note":
 		return "已读取笔记全文"
+	case "list_all_notes":
+		var parsed struct {
+			Total int `json:"total"`
+		}
+		if err := json.Unmarshal([]byte(r.Content), &parsed); err == nil {
+			return fmt.Sprintf("共 %d 条笔记", parsed.Total)
+		}
+		return "已获取全部笔记"
+	case "run_subagent":
+		return "子代理已完成任务"
 	case "list_categories":
 		return "已获取分类列表"
 	case "replace_note_section":

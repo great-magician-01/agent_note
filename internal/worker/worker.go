@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/great-magician-01/agent_note/internal/ai"
 	"github.com/great-magician-01/agent_note/internal/database"
@@ -120,7 +121,10 @@ func process(noteID int64) error {
 	var meta metaResult
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		call, err := client.ChatToolCall(context.Background(), ai.MetaExtractPrompt, userContent, ai.MetaExtractTool)
+		start := time.Now()
+		call, usage, err := client.ChatToolCall(context.Background(), ai.MetaExtractPrompt, userContent, ai.MetaExtractTool)
+		// 每次调用（含重试）落一条调用记录；写库失败不影响主流程
+		logCall(noteID, cfg.Model, attempt+1, usage, time.Since(start), err)
 		if err != nil {
 			lastErr = err
 			if err == ai.ErrNoToolCall {
@@ -249,6 +253,30 @@ func upsertEntity(tx *gorm.DB, name, etype string) (int64, error) {
 		return 0, err
 	}
 	return ent.ID, nil
+}
+
+// logCall 落一条 AI 调用记录到 ai_call_logs（尽力而为：写库失败仅打日志，不影响元数据主流程）
+func logCall(noteID int64, model string, attempt int, usage *ai.Usage, dur time.Duration, callErr error) {
+	rec := models.AICallLog{
+		ID:         snowflake.Next(),
+		Kind:       "meta_extract",
+		NoteID:     &noteID,
+		Model:      model,
+		Attempt:    attempt,
+		Success:    callErr == nil,
+		DurationMs: dur.Milliseconds(),
+	}
+	if usage != nil {
+		raw, _ := json.Marshal(usage)
+		s := string(raw)
+		rec.Usage = &s
+	}
+	if callErr != nil {
+		rec.Error = callErr.Error()
+	}
+	if err := database.DB.Create(&rec).Error; err != nil {
+		log.Printf("[worker] note %d 调用记录写库失败: %v", noteID, err)
+	}
 }
 
 func markFailed(noteID int64, reason string) error {

@@ -2,11 +2,14 @@
   "name": "web",
   "private": true,
   "version": "0.0.0",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@bytemd/plugin-gfm": "^1.22.0",
@@ -30,9 +33,11 @@
     "@types/node": "^24.13.3",
     "@vitejs/plugin-vue": "^6.0.8",
     "@vue/tsconfig": "^0.9.1",
+    "happy-dom": "^20.11.2",
     "tailwindcss": "^4.3.3",
     "typescript": "~6.0.2",
     "vite": "^8.2.0",
+    "vitest": "^4.1.10",
     "vue-tsc": "^3.3.8"
   }
 }

@@ -119,3 +119,7 @@ docker run -d --name agent-note -p 7562:7562 \
 - 接口仅 GET / POST（写操作走 `/xxx/create|update|delete` 子路径）
 - 数据库无外键；全表 `is_active` 软删除；级联清理由应用层事务完成
 - 主键为雪花 ID（int64），返回前端一律序列化为字符串
+
+## 许可证
+
+[MIT](LICENSE)

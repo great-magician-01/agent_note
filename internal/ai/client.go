@@ -62,11 +62,17 @@ type ToolFunction struct {
 }
 
 type chatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Tools       []Tool    `json:"tools,omitempty"`
-	Stream      bool      `json:"stream"`
-	Temperature *float64  `json:"temperature,omitempty"`
+	Model         string         `json:"model"`
+	Messages      []Message      `json:"messages"`
+	Tools         []Tool         `json:"tools,omitempty"`
+	Stream        bool           `json:"stream"`
+	StreamOptions *streamOptions `json:"stream_options,omitempty"`
+	Temperature   *float64       `json:"temperature,omitempty"`
+}
+
+// streamOptions 流式附加选项：include_usage 要求服务商在流末尾返回 token 用量
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 // ---- 流式响应解析 ----
@@ -93,16 +99,61 @@ type toolCallChunk struct {
 
 type streamResponse struct {
 	Choices []streamChoice `json:"choices"`
+	Usage   *usageRaw      `json:"usage"`
 	Error   *struct {
 		Message string `json:"message"`
 	} `json:"error"`
 }
 
+// usageRaw 接口返回的原始 token 用量（各家服务商字段并存，归一化为 Usage 后使用）
+type usageRaw struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+	// DeepSeek 系：缓存命中/未命中
+	PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
+	PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+	// OpenAI 系：输入/输出细分
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	CompletionTokensDetails *struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details"`
+}
+
+// Usage 归一化后的 token 用量：随 assistant 消息落库，并作为 agent 循环上下文压缩的触发依据
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`              // 输入
+	CompletionTokens int `json:"completion_tokens"`          // 输出
+	TotalTokens      int `json:"total_tokens"`               // 合计
+	CachedTokens     int `json:"cached_tokens,omitempty"`    // 输入中命中缓存的部分
+	ReasoningTokens  int `json:"reasoning_tokens,omitempty"` // 输出中的思考部分（推理模型）
+}
+
+// normalize 归一各家字段差异（缓存命中：OpenAI 的 cached_tokens 与 DeepSeek 的 prompt_cache_hit_tokens）
+func (r *usageRaw) normalize() *Usage {
+	u := &Usage{
+		PromptTokens:     r.PromptTokens,
+		CompletionTokens: r.CompletionTokens,
+		TotalTokens:      r.TotalTokens,
+		CachedTokens:     r.PromptCacheHitTokens,
+	}
+	if r.PromptTokensDetails != nil && r.PromptTokensDetails.CachedTokens > 0 {
+		u.CachedTokens = r.PromptTokensDetails.CachedTokens
+	}
+	if r.CompletionTokensDetails != nil {
+		u.ReasoningTokens = r.CompletionTokensDetails.ReasoningTokens
+	}
+	return u
+}
+
 // StreamResult 一轮流式调用的聚合结果
 type StreamResult struct {
 	Content   string
-	Reasoning string // 思考内容（推理模型，可能为空）
+	Reasoning string     // 思考内容（推理模型，可能为空）
 	ToolCalls []ToolCall
+	Usage     *Usage     // token 用量（请求带 include_usage；服务商不返回时为空）
 }
 
 // ChatStream 发起流式 chat 请求；onDelta 回调正文增量，onThink 回调思考增量（均可为 nil）。
@@ -110,10 +161,11 @@ type StreamResult struct {
 // 注意：流中途出错（含 ctx 取消）时返回的 result 携带已聚合的部分内容，err 非 nil。
 func (c *Client) ChatStream(ctx context.Context, messages []Message, tools []Tool, onDelta func(string), onThink func(string)) (*StreamResult, error) {
 	body := chatRequest{
-		Model:    c.Model,
-		Messages: messages,
-		Tools:    tools,
-		Stream:   true,
+		Model:         c.Model,
+		Messages:      messages,
+		Tools:         tools,
+		Stream:        true,
+		StreamOptions: &streamOptions{IncludeUsage: true},
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -162,6 +214,10 @@ func (c *Client) ChatStream(ctx context.Context, messages []Message, tools []Too
 		}
 		if chunk.Error != nil {
 			return result, fmt.Errorf("AI 服务错误: %s", chunk.Error.Message)
+		}
+		// usage 通常在末尾的独立空 choices 块中返回（stream_options.include_usage）
+		if chunk.Usage != nil {
+			result.Usage = chunk.Usage.normalize()
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -261,7 +317,8 @@ var ErrNoToolCall = fmt.Errorf("模型未调用工具")
 // ChatToolCall 非流式调用，期望模型通过**工具调用**返回结构化内容。
 // 优先用 tool_choice 强制指定工具；服务商不支持 tool_choice（HTTP 4xx）时降级为仅靠提示词引导。
 // 模型最终仍未调用工具时返回 ErrNoToolCall。
-func (c *Client) ChatToolCall(ctx context.Context, systemPrompt, userContent string, tool Tool) (*ToolCall, error) {
+// 同时返回归一化后的 token 用量（服务商不返回时为 nil；ErrNoToolCall 时也尽量带回用量供记录）
+func (c *Client) ChatToolCall(ctx context.Context, systemPrompt, userContent string, tool Tool) (*ToolCall, *Usage, error) {
 	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
@@ -319,16 +376,16 @@ func (c *Client) ChatToolCall(ctx context.Context, systemPrompt, userContent str
 	// 第一次：带 tool_choice 强制；若 4xx（多半是不支持 tool_choice）→ 降级重试
 	status, raw, err := do(buildBody(true))
 	if err != nil {
-		return nil, fmt.Errorf("请求 AI 服务失败: %w", err)
+		return nil, nil, fmt.Errorf("请求 AI 服务失败: %w", err)
 	}
 	if status == http.StatusBadRequest || status == http.StatusUnprocessableEntity {
 		status, raw, err = do(buildBody(false))
 		if err != nil {
-			return nil, fmt.Errorf("请求 AI 服务失败: %w", err)
+			return nil, nil, fmt.Errorf("请求 AI 服务失败: %w", err)
 		}
 	}
 	if status != http.StatusOK {
-		return nil, fmt.Errorf("AI 服务返回 %d: %s", status, string(raw))
+		return nil, nil, fmt.Errorf("AI 服务返回 %d: %s", status, string(raw))
 	}
 
 	var parsed struct {
@@ -338,19 +395,24 @@ func (c *Client) ChatToolCall(ctx context.Context, systemPrompt, userContent str
 				ToolCalls []ToolCall `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage *usageRaw `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil, fmt.Errorf("响应解析失败: %w", err)
+		return nil, nil, fmt.Errorf("响应解析失败: %w", err)
+	}
+	var usage *Usage
+	if parsed.Usage != nil {
+		usage = parsed.Usage.normalize()
 	}
 	if len(parsed.Choices) == 0 {
-		return nil, fmt.Errorf("响应无 choices")
+		return nil, usage, fmt.Errorf("响应无 choices")
 	}
 
 	// 找到目标工具调用
 	for _, tc := range parsed.Choices[0].Message.ToolCalls {
 		if tc.Function.Name == tool.Function.Name && tc.Function.Arguments != "" {
-			return &tc, nil
+			return &tc, usage, nil
 		}
 	}
-	return nil, ErrNoToolCall
+	return nil, usage, ErrNoToolCall
 }

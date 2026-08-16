@@ -54,6 +54,7 @@ func AutoMigrate() error {
 		&models.AIConfig{},
 		&models.Conversation{},
 		&models.Message{},
+		&models.AICallLog{},
 		&models.Upload{},
 	)
 }

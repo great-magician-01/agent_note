@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -19,8 +20,8 @@ type ToolResult struct {
 	NoteUpdated *int64 // 写作工具修改的笔记 id（触发 SSE note_updated）
 }
 
-// ToolExecutor 工具执行函数
-type ToolExecutor func(argsJSON string) (*ToolResult, error)
+// ToolExecutor 工具执行函数（ctx 用于取消长耗时操作，如子代理的 AI 调用）
+type ToolExecutor func(ctx context.Context, argsJSON string) (*ToolResult, error)
 
 // ToolDef 工具定义 + 执行器
 type ToolDef struct {
@@ -50,18 +51,30 @@ func ToolsForScope(noteBound bool) []Tool {
 	return out
 }
 
+// subAgentToolOrder 子代理可用工具：只读检索类，不含写作工具与 run_subagent 自身（防递归）
+var subAgentToolOrder = []string{"search_notes", "get_note", "list_all_notes"}
+
+// SubAgentTools 返回子代理可用的工具列表
+func SubAgentTools() []Tool {
+	out := make([]Tool, 0, len(subAgentToolOrder))
+	for _, name := range subAgentToolOrder {
+		out = append(out, Registry[name].Def)
+	}
+	return out
+}
+
 var toolOrder = []string{
-	"search_notes", "get_note", "list_categories",
+	"search_notes", "get_note", "list_all_notes", "list_categories", "run_subagent",
 	"replace_note_section", "append_note_content", "update_note_title", "create_note",
 }
 
 // Execute 执行工具
-func Execute(name, argsJSON string) (*ToolResult, error) {
+func Execute(ctx context.Context, name, argsJSON string) (*ToolResult, error) {
 	t, ok := Registry[name]
 	if !ok {
 		return nil, fmt.Errorf("未知工具: %s", name)
 	}
-	return t.Executor(argsJSON)
+	return t.Executor(ctx, argsJSON)
 }
 
 func init() {
@@ -106,6 +119,19 @@ func init() {
 		Executor: execGetNote,
 	})
 
+	// ---------- list_all_notes ----------
+	register(&ToolDef{
+		Def: Tool{
+			Type: "function",
+			Function: ToolFunction{
+				Name:        "list_all_notes",
+				Description: "获取笔记库中全部笔记的概览列表：标题、简介、标签、实体、创建与修改时间（不含正文）。用户想纵览全库、按时间或标签整体梳理时使用；需要正文再调 get_note。",
+				Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+			},
+		},
+		Executor: execListAllNotes,
+	})
+
 	// ---------- list_categories ----------
 	register(&ToolDef{
 		Def: Tool{
@@ -117,6 +143,25 @@ func init() {
 			},
 		},
 		Executor: execListCategories,
+	})
+
+	// ---------- run_subagent ----------
+	register(&ToolDef{
+		Def: Tool{
+			Type: "function",
+			Function: ToolFunction{
+				Name:        "run_subagent",
+				Description: "委派一个子代理处理需要阅读大量笔记的长上下文任务（如全库总结、多篇笔记对比归纳）。子代理拥有独立上下文，可自行检索并通读笔记全文，完成后返回精炼结论；它只读不写。当任务需要通读多篇笔记、直接处理会让对话上下文过长时，优先使用本工具。",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"task": map[string]any{"type": "string", "description": "交给子代理的任务描述，需自包含（目标、范围、期望产出）"},
+					},
+					"required": []string{"task"},
+				},
+			},
+		},
+		Executor: execRunSubAgent,
 	})
 
 	// ---------- replace_note_section ----------
@@ -208,7 +253,7 @@ func init() {
 
 // ==================== 检索类执行器 ====================
 
-func execSearchNotes(argsJSON string) (*ToolResult, error) {
+func execSearchNotes(_ context.Context, argsJSON string) (*ToolResult, error) {
 	var args struct {
 		Keywords []string `json:"keywords"`
 		Tags     []string `json:"tags"`
@@ -264,7 +309,7 @@ func execSearchNotes(argsJSON string) (*ToolResult, error) {
 	return &ToolResult{Content: string(raw)}, nil
 }
 
-func execGetNote(argsJSON string) (*ToolResult, error) {
+func execGetNote(_ context.Context, argsJSON string) (*ToolResult, error) {
 	var args struct {
 		NoteID string `json:"note_id"`
 	}
@@ -285,7 +330,61 @@ func execGetNote(argsJSON string) (*ToolResult, error) {
 	return &ToolResult{Content: string(raw)}, nil
 }
 
-func execListCategories(_ string) (*ToolResult, error) {
+func execListAllNotes(_ context.Context, _ string) (*ToolResult, error) {
+	var notes []models.Note
+	if err := database.DB.
+		Select("id", "title", "summary", "created_at", "updated_at").
+		Where("is_active = 1").
+		Order("updated_at DESC").
+		Find(&notes).Error; err != nil {
+		return nil, err
+	}
+
+	ids := make([]int64, 0, len(notes))
+	for _, n := range notes {
+		ids = append(ids, n.ID)
+	}
+	tagMap, entityMap, err := services.LoadNoteMeta(ids)
+	if err != nil {
+		return nil, err
+	}
+
+	type item struct {
+		ID        string              `json:"id"`
+		Title     string              `json:"title"`
+		Summary   string              `json:"summary"`
+		Tags      []string            `json:"tags"`
+		Entities  []services.EntityVO `json:"entities"`
+		CreatedAt string              `json:"created_at"`
+		UpdatedAt string              `json:"updated_at"`
+	}
+	items := make([]item, 0, len(notes))
+	for _, n := range notes {
+		tags := tagMap[n.ID]
+		if tags == nil {
+			tags = []string{}
+		}
+		ents := entityMap[n.ID]
+		if ents == nil {
+			ents = []services.EntityVO{}
+		}
+		summary := n.Summary
+		if summary == "" {
+			summary = "(简介尚未生成)"
+		}
+		items = append(items, item{
+			ID: strconv.FormatInt(n.ID, 10), Title: n.Title,
+			Summary: summary, Tags: tags, Entities: ents,
+			CreatedAt: n.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+			UpdatedAt: n.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		})
+	}
+
+	raw, _ := json.Marshal(map[string]any{"total": len(items), "notes": items})
+	return &ToolResult{Content: string(raw)}, nil
+}
+
+func execListCategories(_ context.Context, _ string) (*ToolResult, error) {
 	var cats []models.Category
 	if err := database.DB.Where("is_active = 1").Order("sort, id").Find(&cats).Error; err != nil {
 		return nil, err
@@ -335,7 +434,7 @@ func applyNoteWrite(noteID int64, mutate func(content string) (string, error)) (
 	}, nil
 }
 
-func execReplaceNoteSection(argsJSON string) (*ToolResult, error) {
+func execReplaceNoteSection(_ context.Context, argsJSON string) (*ToolResult, error) {
 	var args struct {
 		NoteID  string `json:"note_id"`
 		OldText string `json:"old_text"`
@@ -360,7 +459,7 @@ func execReplaceNoteSection(argsJSON string) (*ToolResult, error) {
 	})
 }
 
-func execAppendNoteContent(argsJSON string) (*ToolResult, error) {
+func execAppendNoteContent(_ context.Context, argsJSON string) (*ToolResult, error) {
 	var args struct {
 		NoteID  string `json:"note_id"`
 		Content string `json:"content"`
@@ -385,7 +484,7 @@ func execAppendNoteContent(argsJSON string) (*ToolResult, error) {
 	})
 }
 
-func execUpdateNoteTitle(argsJSON string) (*ToolResult, error) {
+func execUpdateNoteTitle(_ context.Context, argsJSON string) (*ToolResult, error) {
 	var args struct {
 		NoteID string `json:"note_id"`
 		Title  string `json:"title"`
@@ -413,7 +512,7 @@ func execUpdateNoteTitle(argsJSON string) (*ToolResult, error) {
 	return &ToolResult{Content: `{"ok":true}`, NoteUpdated: &id}, nil
 }
 
-func execCreateNote(argsJSON string) (*ToolResult, error) {
+func execCreateNote(_ context.Context, argsJSON string) (*ToolResult, error) {
 	var args struct {
 		Title      string `json:"title"`
 		Content    string `json:"content"`

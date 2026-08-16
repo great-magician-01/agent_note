@@ -103,10 +103,26 @@ type Message struct {
 	Content        string    `gorm:"type:text;not null;default:''" json:"content"`
 	ToolCalls      *string   `gorm:"type:jsonb" json:"tool_calls,omitempty"` // assistant 工具调用（原样回放）
 	Reasoning      *string   `gorm:"type:text" json:"reasoning,omitempty"`   // assistant 思考内容（推理模型）
+	Usage          *string   `gorm:"type:jsonb" json:"usage,omitempty"`      // assistant 该轮 token 用量（归一化 JSON）
 	ToolCallID     string    `gorm:"size:64" json:"tool_call_id,omitempty"`  // tool 消息归属
 	Name           string    `gorm:"size:64" json:"name,omitempty"`          // tool 消息工具名
 	IsActive       int       `gorm:"not null;default:1" json:"-"`
 	CreatedAt      time.Time `json:"created_at"`
+}
+
+// AICallLog AI 调用记录（非会话类调用，如 worker 元数据提取；会话类用量随 messages.usage 落库）
+type AICallLog struct {
+	ID         int64     `gorm:"primaryKey" json:"id,string"`
+	Kind       string    `gorm:"size:32;not null;index" json:"kind"`   // meta_extract 等
+	NoteID     *int64    `gorm:"index" json:"note_id,string"`          // 关联笔记（元数据提取）
+	Model      string    `gorm:"size:128;not null;default:''" json:"model"`
+	Attempt    int       `gorm:"not null;default:1" json:"attempt"`    // 同一任务内的重试序号
+	Usage      *string   `gorm:"type:jsonb" json:"usage,omitempty"`    // 归一化 token 用量（输入/输出/缓存/思考）
+	Success    bool      `gorm:"not null;default:false" json:"success"`
+	Error      string    `gorm:"type:text;not null;default:''" json:"error,omitempty"`
+	DurationMs int64     `gorm:"not null;default:0" json:"duration_ms"`
+	IsActive   int       `gorm:"not null;default:1" json:"-"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 // Upload 上传文件
