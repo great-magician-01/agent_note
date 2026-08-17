@@ -2,7 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import MarkdownIt from 'markdown-it'
-import { buildViewItems, toolLabel, useChatStore } from '../stores/chat'
+import { buildViewItems, toolLabel, useChatStore, type ChatViewItem } from '../stores/chat'
 import { useAIConfigStore } from '../stores/aiConfigs'
 
 const props = defineProps<{
@@ -42,9 +42,39 @@ function toggleExpand(key: string) {
   expandedKeys.value = s
 }
 
-function renderMd(text: string): string {
-  return md.render(text)
+// ---- markdown 渲染缓存 + 流式节流（~80ms）----
+// 流式期间每个 delta 都会触发重渲，逐个 md.render 太贵：
+// 缓存每条消息的渲染结果，streaming 时限频刷新，结束后（streaming=false）立即终渲
+const mdCache = new Map<string, { src: string; html: string; at: number }>()
+const renderTick = ref(0)
+let mdTimer: ReturnType<typeof setTimeout> | undefined
+
+function renderMd(item: ChatViewItem): string {
+  renderTick.value // 依赖收集：节流定时器到点后 bump，触发重渲
+  const cached = mdCache.get(item.key)
+  if (cached && cached.src === item.content) return cached.html
+  if (item.streaming && cached) {
+    const elapsed = Date.now() - cached.at
+    if (elapsed < 80) {
+      if (!mdTimer) {
+        mdTimer = setTimeout(() => {
+          mdTimer = undefined
+          renderTick.value++
+        }, 80 - elapsed + 5)
+      }
+      return cached.html
+    }
+  }
+  const html = md.render(item.content)
+  mdCache.set(item.key, { src: item.content, html, at: Date.now() })
+  return html
 }
+
+// 切换会话时清掉渲染缓存
+watch(
+  () => chat.currentId,
+  () => mdCache.clear(),
+)
 
 // 工具结果/参数展示：尝试 JSON 美化
 function prettyText(raw?: string): string {
@@ -56,8 +86,25 @@ function prettyText(raw?: string): string {
   }
 }
 
+// ---- 滚动：用户原本在底部（距底 <60px）才吸底，否则显示「回到底部」浮钮 ----
+const stuckToBottom = ref(true)
+const showBackToBottom = ref(false)
+
+function isNearBottom(): boolean {
+  const el = listEl.value
+  if (!el) return true
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 60
+}
+
+function onScroll() {
+  stuckToBottom.value = isNearBottom()
+  if (stuckToBottom.value) showBackToBottom.value = false
+}
+
 async function scrollToBottom() {
   await nextTick()
+  stuckToBottom.value = true
+  showBackToBottom.value = false
   if (listEl.value) listEl.value.scrollTop = listEl.value.scrollHeight
 }
 
@@ -67,7 +114,13 @@ watch(
     const last = items[items.length - 1]
     return `${items.length}|${last?.content.length ?? 0}`
   },
-  () => scrollToBottom(),
+  async () => {
+    if (stuckToBottom.value) {
+      await scrollToBottom()
+    } else {
+      showBackToBottom.value = true
+    }
+  },
 )
 
 // 写作工具改库 → 通知父组件刷新编辑器
@@ -92,6 +145,8 @@ async function send() {
 }
 
 function onKeydown(e: KeyboardEvent) {
+  // IME 输入法组词期间的 Enter 不发送
+  if (e.isComposing) return
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
     send()
@@ -115,7 +170,10 @@ watch(
 )
 
 // 离开页面时中断在飞消息（后端随连接断开取消上游请求）
-onUnmounted(() => chat.stop())
+onUnmounted(() => {
+  clearTimeout(mdTimer)
+  chat.stop()
+})
 </script>
 
 <template>
@@ -190,7 +248,7 @@ onUnmounted(() => chat.stop())
 
     <template v-else>
       <!-- 消息区 -->
-      <div ref="listEl" class="flex-1 overflow-y-auto px-4 py-4 space-y-4 min-h-0">
+      <div ref="listEl" class="flex-1 overflow-y-auto px-4 py-4 space-y-4 min-h-0" @scroll="onScroll">
         <!-- 空状态 -->
         <div
           v-if="chat.messages.length === 0"
@@ -275,12 +333,23 @@ onUnmounted(() => chat.stop())
             <div
               class="max-w-[92%] px-3.5 py-2.5 rounded-[14px] rounded-bl-[4px] glass-2 text-[13px] leading-relaxed break-words chat-md"
             >
-              <div v-if="item.content" v-html="renderMd(item.content)" />
+              <div v-if="item.content" v-html="renderMd(item)" />
               <span v-if="item.streaming" class="inline-block w-2 h-4 ml-0.5 align-middle bg-[var(--accent)] animate-pulse" />
             </div>
           </div>
         </template>
       </div>
+
+      <!-- 「回到底部」浮钮：用户上翻时有新内容流入才显示（定位在滚动容器外） -->
+      <Transition name="fade">
+        <button
+          v-if="showBackToBottom"
+          class="absolute bottom-[76px] left-1/2 -translate-x-1/2 z-10 h-8 px-3.5 rounded-full glass-3 text-[12px] text-[var(--text-1)] hover:bg-[var(--glass-border-strong)] transition-colors flex items-center gap-1.5"
+          @click="scrollToBottom"
+        >
+          <span class="text-[10px]">↓</span> 回到底部
+        </button>
+      </Transition>
 
       <!-- 输入区 -->
       <div class="p-3 border-t border-[var(--glass-border)] shrink-0">

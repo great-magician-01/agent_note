@@ -16,8 +16,36 @@ import (
 
 // ToolResult 工具执行结果
 type ToolResult struct {
-	Content     string // 回传给模型的 JSON 文本
-	NoteUpdated *int64 // 写作工具修改的笔记 id（触发 SSE note_updated）
+	Content     string        // 回传给模型的 JSON 文本
+	NoteUpdated *int64        // 写作工具修改的笔记 id（触发 SSE note_updated）
+	Proposal    *NoteProposal // 正文修改提案（触发 SSE note_proposal，用户审核后才落库）
+}
+
+// NoteProposal 正文修改提案：正文类写作工具产出，不落库，
+// 经 SSE 推送由用户审核通过后走常规更新接口生效
+type NoteProposal struct {
+	NoteID     int64  // 目标笔记 id
+	Tool       string // 产出提案的工具名
+	NewContent string // 修改后的完整正文
+}
+
+// ctxKey context 键类型（防冲突）
+type ctxKey string
+
+// boundNoteKey 会话绑定笔记 id 的 context 键
+const boundNoteKey ctxKey = "boundNoteID"
+
+// WithBoundNoteID 将会话绑定的笔记 id 注入 ctx，写作工具据此强制校验目标笔记
+func WithBoundNoteID(ctx context.Context, noteID int64) context.Context {
+	return context.WithValue(ctx, boundNoteKey, noteID)
+}
+
+// checkBoundNote 校验写作工具的目标笔记是否为当前会话绑定的笔记；ctx 无绑定值时放行
+func checkBoundNote(ctx context.Context, noteID int64) error {
+	if bound, ok := ctx.Value(boundNoteKey).(int64); ok && bound != noteID {
+		return fmt.Errorf("只能修改当前会话绑定的笔记 (id=%d)", bound)
+	}
+	return nil
 }
 
 // ToolExecutor 工具执行函数（ctx 用于取消长耗时操作，如子代理的 AI 调用）
@@ -171,7 +199,7 @@ func init() {
 			Type: "function",
 			Function: ToolFunction{
 				Name:        "replace_note_section",
-				Description: "用 new_text 精确替换笔记中的 old_text 片段。old_text 必须与原文一字不差（从 get_note 结果中逐字复制），否则替换失败。",
+				Description: "用 new_text 精确替换笔记中的 old_text 片段。old_text 必须与原文一字不差（从 get_note 结果中逐字复制），否则替换失败。修改不直接生效，而是作为提案提交给用户审核。",
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -193,7 +221,7 @@ func init() {
 			Type: "function",
 			Function: ToolFunction{
 				Name:        "append_note_content",
-				Description: "在笔记末尾追加内容。",
+				Description: "在笔记末尾追加内容。修改不直接生效，而是作为提案提交给用户审核。",
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -403,8 +431,9 @@ func execListCategories(_ context.Context, _ string) (*ToolResult, error) {
 
 // ==================== 写作类执行器 ====================
 
-// applyNoteWrite 写作工具公共流程：更新内容（同事务标记元数据 pending）→ 通知 worker
-func applyNoteWrite(noteID int64, mutate func(content string) (string, error)) (*ToolResult, error) {
+// proposeNoteWrite 正文类写作工具公共流程：读取当前内容并应用修改，产出修改提案。
+// 不写库、不触发元数据钩子：提案经 SSE 推给前端，用户审核通过后才由常规更新接口落库。
+func proposeNoteWrite(noteID int64, toolName string, mutate func(content string) (string, error)) (*ToolResult, error) {
 	var note models.Note
 	if err := database.DB.Where("id = ? AND is_active = 1", noteID).First(&note).Error; err != nil {
 		return nil, fmt.Errorf("笔记不存在 (id=%d)", noteID)
@@ -415,26 +444,30 @@ func applyNoteWrite(noteID int64, mutate func(content string) (string, error)) (
 		return nil, err
 	}
 
-	err = database.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&models.Note{}).
-			Where("id = ?", noteID).
-			Update("content_md", newContent).Error; err != nil {
-			return err
-		}
-		return services.TouchNoteForMeta(tx, noteID, newContent)
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	services.OnNoteContentChanged(noteID)
 	return &ToolResult{
-		Content:     `{"ok":true}`,
-		NoteUpdated: &noteID,
+		Content:  `{"ok":true,"pending_review":true,"message":"修改已提交用户审核，用户接受后才会生效"}`,
+		Proposal: &NoteProposal{NoteID: noteID, Tool: toolName, NewContent: newContent},
 	}, nil
 }
 
-func execReplaceNoteSection(_ context.Context, argsJSON string) (*ToolResult, error) {
+// replaceSection 精确替换正文片段（proposeNoteWrite 的 mutate 逻辑，纯函数便于测试）
+func replaceSection(content, oldText, newText string) (string, error) {
+	if !strings.Contains(content, oldText) {
+		return "", fmt.Errorf("替换失败：未在笔记中找到与 old_text 完全一致的片段。请先调用 get_note 获取原文，逐字复制后再试")
+	}
+	return strings.Replace(content, oldText, newText, 1), nil
+}
+
+// appendContent 在正文末尾追加内容（空正文不加前导分隔；纯函数便于测试）
+func appendContent(content, add string) string {
+	sep := "\n\n"
+	if content == "" {
+		sep = ""
+	}
+	return content + sep + add
+}
+
+func execReplaceNoteSection(ctx context.Context, argsJSON string) (*ToolResult, error) {
 	var args struct {
 		NoteID  string `json:"note_id"`
 		OldText string `json:"old_text"`
@@ -447,19 +480,19 @@ func execReplaceNoteSection(_ context.Context, argsJSON string) (*ToolResult, er
 	if err != nil {
 		return nil, fmt.Errorf("note_id 格式错误")
 	}
+	if err := checkBoundNote(ctx, id); err != nil {
+		return nil, err
+	}
 	if args.OldText == "" {
 		return nil, fmt.Errorf("old_text 不能为空")
 	}
 
-	return applyNoteWrite(id, func(content string) (string, error) {
-		if !strings.Contains(content, args.OldText) {
-			return "", fmt.Errorf("替换失败：未在笔记中找到与 old_text 完全一致的片段。请先调用 get_note 获取原文，逐字复制后再试")
-		}
-		return strings.Replace(content, args.OldText, args.NewText, 1), nil
+	return proposeNoteWrite(id, "replace_note_section", func(content string) (string, error) {
+		return replaceSection(content, args.OldText, args.NewText)
 	})
 }
 
-func execAppendNoteContent(_ context.Context, argsJSON string) (*ToolResult, error) {
+func execAppendNoteContent(ctx context.Context, argsJSON string) (*ToolResult, error) {
 	var args struct {
 		NoteID  string `json:"note_id"`
 		Content string `json:"content"`
@@ -471,16 +504,15 @@ func execAppendNoteContent(_ context.Context, argsJSON string) (*ToolResult, err
 	if err != nil {
 		return nil, fmt.Errorf("note_id 格式错误")
 	}
+	if err := checkBoundNote(ctx, id); err != nil {
+		return nil, err
+	}
 	if args.Content == "" {
 		return nil, fmt.Errorf("content 不能为空")
 	}
 
-	return applyNoteWrite(id, func(content string) (string, error) {
-		sep := "\n\n"
-		if content == "" {
-			sep = ""
-		}
-		return content + sep + args.Content, nil
+	return proposeNoteWrite(id, "append_note_content", func(content string) (string, error) {
+		return appendContent(content, args.Content), nil
 	})
 }
 

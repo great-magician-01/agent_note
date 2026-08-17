@@ -35,6 +35,12 @@ func execRunSubAgent(ctx context.Context, argsJSON string) (*ToolResult, error) 
 	}
 	tools := SubAgentTools()
 
+	// 子代理可用工具白名单：执行前校验，拦截模型越权调用（如写作类工具）
+	allowed := make(map[string]bool, len(tools))
+	for _, t := range tools {
+		allowed[t.Function.Name] = true
+	}
+
 	var guard LoopGuard
 	forceFinal := false   // 判定停滞后，下一轮不带工具强制模型收尾
 	lastPromptTokens := 0 // 上一轮接口返回的输入 token 数（驱动上下文压缩；0 = 尚无数据）
@@ -90,13 +96,20 @@ func execRunSubAgent(ctx context.Context, argsJSON string) (*ToolResult, error) 
 			ToolCalls: result.ToolCalls,
 		})
 		for _, tc := range result.ToolCalls {
-			toolResult, execErr := Execute(ctx, tc.Function.Name, tc.Function.Arguments)
 			var toolContent string
-			if execErr != nil {
-				errRaw, _ := json.Marshal(map[string]string{"error": execErr.Error()})
+			if !allowed[tc.Function.Name] {
+				// 白名单外的工具：不执行，直接返回错误工具结果让模型改用可用工具
+				log.Printf("[subagent] 拦截白名单外工具调用: %s", tc.Function.Name)
+				errRaw, _ := json.Marshal(map[string]string{"error": "该工具在子代理中不可用"})
 				toolContent = string(errRaw)
 			} else {
-				toolContent = toolResult.Content
+				toolResult, execErr := Execute(ctx, tc.Function.Name, tc.Function.Arguments)
+				if execErr != nil {
+					errRaw, _ := json.Marshal(map[string]string{"error": execErr.Error()})
+					toolContent = string(errRaw)
+				} else {
+					toolContent = toolResult.Content
+				}
 			}
 			messages = append(messages, Message{
 				Role:       "tool",

@@ -53,7 +53,7 @@ const itemClass = (active: boolean) =>
 </script>
 
 <template>
-  <nav class="w-[220px] shrink-0 flex flex-col py-4 pl-4 pr-3 overflow-y-auto">
+  <nav class="hidden lg:flex w-[220px] shrink-0 flex-col py-4 pl-4 pr-3 overflow-y-auto">
     <div class="text-[12px] tracking-[1px] text-[var(--text-3)] px-3 mb-2">分类</div>
 
     <!-- 全部笔记 -->

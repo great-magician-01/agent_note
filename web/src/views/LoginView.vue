@@ -27,8 +27,8 @@ async function submit() {
 </script>
 
 <template>
-  <div class="h-full flex items-center justify-center">
-    <div class="glass-2 reveal rounded-[20px] w-[420px] px-10 py-12">
+  <div class="h-full flex items-center justify-center px-4">
+    <div class="glass-2 reveal rounded-[20px] w-full max-w-[420px] px-6 sm:px-10 py-12">
       <!-- Logo -->
       <div class="text-center mb-8">
         <div

@@ -157,3 +157,86 @@ func TestExecutorValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestCheckBoundNote 验证绑定笔记校验纯函数：
+// ctx 无绑定值放行；绑定值与目标一致放行；不一致则拒绝。
+func TestCheckBoundNote(t *testing.T) {
+	if err := checkBoundNote(context.Background(), 123); err != nil {
+		t.Errorf("无绑定值应放行, got: %v", err)
+	}
+	ctx := WithBoundNoteID(context.Background(), 100)
+	if err := checkBoundNote(ctx, 100); err != nil {
+		t.Errorf("绑定值一致应放行, got: %v", err)
+	}
+	err := checkBoundNote(ctx, 999)
+	if err == nil {
+		t.Fatal("绑定值不一致应拒绝，实际为 nil")
+	}
+	if !strings.Contains(err.Error(), "只能修改当前会话绑定的笔记") {
+		t.Errorf("错误信息应为绑定提示, got: %v", err)
+	}
+}
+
+// TestWritingToolBoundNoteEnforcement 验证正文类写作工具的 note_id 强制校验（经 Execute 全链路）。
+// 拦截发生在触库之前，DB 为 nil 也安全；匹配用例以紧随其后的参数校验错误证明未被拦截。
+func TestWritingToolBoundNoteEnforcement(t *testing.T) {
+	bound := WithBoundNoteID(context.Background(), 100)
+
+	cases := []struct {
+		name    string
+		ctx     context.Context
+		tool    string
+		args    string
+		wantErr string
+	}{
+		// 目标笔记与绑定不一致 → 拦截（先于任何后续校验与 DB 访问）
+		{"replace 拦截非绑定笔记", bound, "replace_note_section", `{"note_id":"999","old_text":"a","new_text":"b"}`, "只能修改当前会话绑定的笔记"},
+		{"append 拦截非绑定笔记", bound, "append_note_content", `{"note_id":"999","content":"x"}`, "只能修改当前会话绑定的笔记"},
+		// 目标与绑定一致 → 不被拦截，落到后续参数校验
+		{"replace 放行绑定笔记", bound, "replace_note_section", `{"note_id":"100","old_text":"","new_text":"b"}`, "old_text 不能为空"},
+		{"append 放行绑定笔记", bound, "append_note_content", `{"note_id":"100","content":""}`, "content 不能为空"},
+		// ctx 无绑定值（兼容全局会话与既有测试）→ 不拦截
+		{"无绑定 ctx 不拦截", context.Background(), "replace_note_section", `{"note_id":"999","old_text":"","new_text":"b"}`, "old_text 不能为空"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Execute(tc.ctx, tc.tool, tc.args)
+			if err == nil {
+				t.Fatalf("期望出错（含 %q），实际为 nil", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("错误信息应含 %q, got: %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// TestReplaceSection 验证替换 mutate 纯函数：精确替换首个匹配；找不到 old_text 时报中文错误。
+// 提案内容正确性在纯函数层覆盖（proposeNoteWrite 本身触库，不在零 DB 测试范围内）。
+func TestReplaceSection(t *testing.T) {
+	got, err := replaceSection("第一段\n目标\n目标\n结尾", "目标", "新内容")
+	if err != nil {
+		t.Fatalf("不应出错: %v", err)
+	}
+	if want := "第一段\n新内容\n目标\n结尾"; got != want {
+		t.Errorf("只替换首个匹配: got %q, want %q", got, want)
+	}
+
+	_, err = replaceSection("正文", "不存在的片段", "x")
+	if err == nil {
+		t.Fatal("old_text 不存在应出错")
+	}
+	if !strings.Contains(err.Error(), "替换失败") {
+		t.Errorf("错误信息应含\"替换失败\", got: %v", err)
+	}
+}
+
+// TestAppendContent 验证追加 mutate 纯函数：非空正文加 \n\n 分隔，空正文无前导分隔。
+func TestAppendContent(t *testing.T) {
+	if got, want := appendContent("已有内容", "追加"), "已有内容\n\n追加"; got != want {
+		t.Errorf("非空正文追加: got %q, want %q", got, want)
+	}
+	if got, want := appendContent("", "追加"), "追加"; got != want {
+		t.Errorf("空正文追加不应有前导分隔: got %q, want %q", got, want)
+	}
+}

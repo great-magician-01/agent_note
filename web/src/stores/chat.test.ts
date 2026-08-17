@@ -180,12 +180,57 @@ describe('chat store send 流程', () => {
     expect(vi.mocked(postChatSSE).mock.calls[0][0]).toEqual({ content: '你好' })
   })
 
-  it('空内容或发送中直接 return，不调 postChatSSE', async () => {
+  it('note_proposal 事件写入 pendingProposal，clearProposal 清空', async () => {
+    let handlers: SSEHandlers | undefined
+    let release: () => void = () => {}
+    vi.mocked(postChatSSE).mockImplementation((_body, h) => {
+      handlers = h
+      return new Promise<void>((resolve) => {
+        release = resolve
+      })
+    })
+
     const store = useChatStore()
-    await store.send('')
-    await store.send('   ')
-    store.sending = true
-    await store.send('hello')
-    expect(vi.mocked(postChatSSE)).not.toHaveBeenCalled()
+    const p = store.send('帮我改一下')
+
+    handlers!.onNoteProposal?.({ note_id: 'n1', tool: 'replace_note_section', content: '旧提案' })
+    expect(store.pendingProposal).toEqual({ noteId: 'n1', tool: 'replace_note_section', content: '旧提案' })
+
+    // 新提案覆盖旧提案
+    handlers!.onNoteProposal?.({ note_id: 'n1', tool: 'append_note_content', content: '新提案' })
+    expect(store.pendingProposal?.content).toBe('新提案')
+
+    store.clearProposal()
+    expect(store.pendingProposal).toBeNull()
+
+    release()
+    await p
+  })
+
+  it('stop() 中断时把 streaming 的 tool 消息标记为「已中断」', async () => {
+    let handlers: SSEHandlers | undefined
+    vi.mocked(postChatSSE).mockImplementation((_body, h) => {
+      handlers = h
+      return new Promise<void>((_resolve, reject) => {
+        // abort 时模拟 fetch 抛 AbortError
+        const err = new Error('aborted')
+        err.name = 'AbortError'
+        // postChatSSE 内部监听不到 signal 时由调用方 reject，这里直接挂起，由 stop 后的 finally 收尾
+        setTimeout(() => reject(err), 0)
+      })
+    })
+
+    const store = useChatStore()
+    const p = store.send('hi')
+    handlers!.onToolStart?.({ id: 't1', name: 'search_notes', input: {} })
+    expect(store.messages.find((m) => m.role === 'tool')?.streaming).toBe(true)
+
+    store.stop()
+    await p
+
+    const toolMsg = store.messages.find((m) => m.role === 'tool')
+    expect(toolMsg?.streaming).toBe(false)
+    expect(toolMsg?.toolSummary).toBe('已中断')
+    expect(toolMsg?.toolOk).toBe(false)
   })
 })

@@ -10,7 +10,7 @@
 - **分类笔记 + Markdown 编辑**：单层分类，ByteMD 编辑器
 - **多 AI 配置**：OpenAI 兼容（baseUrl / apiKey / model），可配多个，同时仅一个激活
 - **保存后异步生成元数据**：AI 提取简介（summary）、标签（tags）、实体（entities），用于检索
-- **AI 对话**：搜索笔记（关键词 + tags + 实体检索，**不做 RAG**）、辅助写作（AI 直接修改笔记内容）
+- **AI 对话**：搜索笔记（关键词 + tags + 实体检索，**不做 RAG**）、辅助写作（AI 产出修改提案，用户在前端 diff 审核接受后才落库）
 
 ## 2. 已确认决策与默认规则
 
@@ -26,7 +26,7 @@
 | 图片 | 编辑器粘贴自动上传到 UPLOAD_DIR |
 | 主题 | 深 / 浅切换，默认深色 |
 | 列表搜索框 | 调接口按关键词过滤（含 tag / 实体命中） |
-| 检索 | ILIKE + 关联查询，不做向量；数据量增长后再加 pg_trgm |
+| 检索 | ILIKE + 关联查询，不做向量；已建 pg_trgm 扩展与 notes(title/content_md) GIN 索引（启动时容错 `CREATE EXTENSION IF NOT EXISTS` + 建索引，失败仅警告不中断启动） |
 | 新建笔记 | 标题留空时自动取正文首行；删除笔记级联删除其绑定会话 |
 | 消息存储 | `user / assistant / tool` 三类（含 tool_calls JSONB），支持上下文回放 |
 | AI 过程提示 | 前端显示工具执行状态（"正在搜索笔记…"、"正在修改内容…"） |
@@ -349,9 +349,12 @@ Note         = NoteListItem + { content_md, category_id: string | null, meta_err
 | `delta` | `{"content":"…"}` | assistant 文本增量 |
 | `tool_start` | `{"name":"search_notes","input":{…}}` | 开始执行工具 |
 | `tool_end` | `{"name":"search_notes","ok":true,"summary":"找到 3 条笔记"}` | 工具结束（summary 供状态行展示） |
-| `note_updated` | `{"note_id":"789…"}` | 写作工具改库后，前端刷新编辑器（字符串） |
+| `note_updated` | `{"note_id":"789…"}` | 直写场景（标题修改、新建笔记等）落库后，前端刷新编辑器（字符串） |
+| `note_proposal` | `{"note_id":"789…","tool":"replace_note_section","content":"<完整新正文>"}` | 正文修改提案（replace_note_section / append_note_content 产出，不落库）；前端弹出行级 diff 审核，「接受」后走 `/api/notes/update` 落库，「拒绝」丢弃 |
 | `done` | `{"conversation_id":"123…"}` | 本轮结束 |
 | `error` | `{"message":"…"}` | 出错终止 |
+
+agent 循环期间每 15s 额外发送一行 SSE 注释心跳（`: ping\n\n`），防止中间层将长循环判定为空闲断连；前端解析器天然忽略注释行。
 
 ### 7.7 上传
 
@@ -494,11 +497,12 @@ Note         = NoteListItem + { content_md, category_id: string | null, meta_err
 **工具执行规则**
 
 - 工具在 Go 侧执行；执行结果作为 `tool` 消息回传模型继续循环，直到模型不再产生 tool_calls
-- 写作工具执行成功后，向 SSE 推 `note_updated` 事件；写作工具的修改同样走「保存 → 元数据重新生成」链路
+- **正文修改走提案审核制**：`replace_note_section` / `append_note_content` 不直接写库，执行后产出 `NoteProposal{NoteID, Tool, NewContent}`（修改后的完整正文），经 SSE `note_proposal` 事件推给前端；前端弹出行级 diff（DiffReviewModal），用户「接受」后走常规 `POST /api/notes/update` 落库（天然复用「保存 → 元数据重新生成」链路），「拒绝」则丢弃。`update_note_title` / `create_note` 保持直写，仍推 `note_updated` 事件
+- 写作工具执行时服务端强制校验参数 note_id 必须等于会话绑定的笔记（`ai.WithBoundNoteID` 注入 ctx），越权修改其他笔记直接报错
 - agent 循环不设固定轮数上限（超限报错是让用户为工程问题买单），收敛由工程手段保证（`internal/ai/agentloop.go`）：
   - 停滞检测：连续 3 轮完全相同的工具调用判定为模型卡死，下一轮改为不带工具调用，强制模型基于已有信息收尾
   - 上下文压缩：上一轮接口返回的输入 token 数超过 400K 预算时（当前主流模型上下文已达 1M，400K 以内无压力），较早的 tool 结果替换为占位说明（保留最近 4 条原文），被省略的内容模型可重新调用工具获取；服务商未返回 usage 时按字符数兜底判断
-- `run_subagent` 启动只读子代理：独立消息上下文，仅可用 search_notes / get_note / list_all_notes（`ai.SubAgentTools()`，不含写作工具与 run_subagent 自身以防递归），收敛机制与主循环相同；最终结论原样作为工具结果回传主代理；子代理的 AI 调用随主 SSE 连接的 ctx 一并取消
+- `run_subagent` 启动只读子代理：独立消息上下文，仅可用 search_notes / get_note / list_all_notes（`ai.SubAgentTools()`，不含写作工具与 run_subagent 自身以防递归），且**服务端执行前强制白名单校验**（白名单外调用不执行，直接返回错误工具结果并记 `[subagent]` 日志，不只靠提示词约束），收敛机制与主循环相同；最终结论原样作为工具结果回传主代理；子代理的 AI 调用随主 SSE 连接的 ctx 一并取消
 
 ### 8.3 系统提示词
 
@@ -523,15 +527,16 @@ Note         = NoteListItem + { content_md, category_id: string | null, meta_err
 - get_note：查看笔记当前内容
 - replace_note_section：精确替换笔记中的某段文字（old_text 必须与原文一字不差）
 - append_note_content：在笔记末尾追加内容
-- update_note_title：修改标题
-- create_note：新建一篇笔记
+- update_note_title：修改标题（立即生效）
+- create_note：新建一篇笔记（立即生效）
 - search_notes / get_note：检索其他笔记作为参考资料
 - list_all_notes：查看全库笔记概览
 - run_subagent：委派子代理处理需要通读大量笔记的长上下文任务
 规则：
-1. 用户要求"写一段/改写/扩写/润色"时，直接修改笔记本身，而不是只在对话里给出文字。
+1. 用户要求"写一段/改写/扩写/润色"时，直接对笔记本身发起修改，而不是只在对话里给出文字。
 2. 使用 replace_note_section 前先调用 get_note，old_text 从原文逐字复制。
-3. 修改完成后简要说明改了什么。
+3. replace_note_section / append_note_content 的修改不会直接写入笔记，而是作为提案提交给用户审核，用户接受后才生效。因此绝对不要声称"已保存""已写入""修改已完成"，只能说明"修改已提交给用户审核"。
+4. 修改提交后简要说明改了什么。
 ```
 
 **子代理**（run_subagent 委派，只读）
@@ -632,13 +637,13 @@ LIMIT $limit;
 3. 返回 `[{id, title, summary, tags, entities}]`（**只回简介，不回全文**）
 4. 模型基于简介判断相关性 → 对相关笔记调 `get_note` 读全文 → 组织回答
 
-### 9.4 AI 写作（后端循环）
+### 9.4 AI 写作（后端循环 + 提案审核）
 
 1. 编辑页发消息前，前端**自动保存**当前编辑器内容（保证库中为最新）
 2. 请求携带 `note_id`；无会话则创建绑定该笔记的会话
-3. 后端 agent 循环：模型 → 产生工具调用 → 执行（读库/写库）→ 结果回传 → 循环，直到仅剩文本
-4. 每次写作工具写库成功 → SSE 推 `note_updated` → 前端拉取最新内容替换编辑器，Toast「AI 已修改笔记」
-5. 写库同样触发元数据重新生成（§9.2）
+3. 后端 agent 循环：模型 → 产生工具调用 → 执行（读库/产出提案）→ 结果回传 → 循环，直到仅剩文本
+4. 正文修改工具产出提案 → SSE 推 `note_proposal`（完整新正文）→ 前端 DiffReviewModal 行级 diff 审核：「接受」走 `POST /api/notes/update` 落库并刷新编辑器，「拒绝」丢弃；标题修改 / 新建笔记直写库 → SSE 推 `note_updated` → 前端拉取最新内容替换编辑器
+5. 落库同样触发元数据重新生成（§9.2）
 
 ### 9.5 软删除与级联清理
 
@@ -670,6 +675,7 @@ agent_note/
 │   ├── models/                # 数据模型（id 字段 `json:"id,string"` 序列化为字符串）
 │   ├── router/                # 路由注册
 │   ├── middleware/            # JWT 鉴权 / CORS / 请求日志
+│   ├── logger/                # 按天切割的文件日志（log_yyyyMMdd.log，同时输出 stdout）
 │   ├── handlers/              # HTTP 处理器（auth/category/note/ai_config/conversation/chat/upload）
 │   ├── services/              # 业务层（笔记、检索、元数据）
 │   ├── ai/                    # OpenAI 兼容客户端、SSE 转发、agent 循环、工具定义与执行
@@ -696,7 +702,7 @@ agent_note/
 | `JWT_SECRET` | JWT 签名密钥 |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | 登录账号（单用户） |
 | `SERVER_PORT` | 服务端口 |
-| `LOG_DIR` | 日志目录 |
+| `LOG_DIR` | 日志目录（按天切割写 `log_yyyyMMdd.log`，写时检查日期跨天自动切换新文件，同时保留 stdout） |
 | `UPLOAD_DIR` | 上传文件目录 |
 | `WEB_DIST_DIR` | 前端构建产物目录（默认 `web/dist`）；存在时后端直接托管页面，未命中的 GET 路径回退 `index.html`（SPA history 模式），`/api`、`/uploads` 除外 |
 | `SNOWFLAKE_NODE` | 雪花算法节点号（单机部署默认 `1`） |

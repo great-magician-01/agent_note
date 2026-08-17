@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -18,6 +19,9 @@ import (
 )
 
 const workerCount = 2
+
+// errContentChanged 处理期间笔记内容被修改（完成写入的 hash 条件未命中），放弃本次结果
+var errContentChanged = errors.New("内容在处理期间已修改")
 
 var (
 	queue   chan int64
@@ -48,10 +52,24 @@ func Enqueue(noteID int64) {
 	}
 	select {
 	case queue <- noteID:
+		log.Printf("[worker] note %d enqueued", noteID)
 	default:
-		// 队列满：丢弃但清除标记，由下次修改重新触发
+		// 队列满：丢弃但清除标记，由下次修改重新触发；
+		// 同时置 failed，避免笔记滞留 pending 状态（启动恢复超容量时同样走这里）
 		pending.Delete(noteID)
-		log.Printf("[worker] queue full, dropped note %d", noteID)
+		log.Printf("[worker] queue full, dropped note %d，置 meta_status=failed", noteID)
+		// database.DB 为 nil 仅发生在无数据库的单元测试中
+		if database.DB == nil {
+			return
+		}
+		if err := database.DB.Model(&models.Note{}).
+			Where("id = ? AND meta_status = 'pending' AND is_active = 1", noteID).
+			Updates(map[string]any{
+				"meta_status": "failed",
+				"meta_error":  "元数据生成队列已满，请稍后手动重试",
+			}).Error; err != nil {
+			log.Printf("[worker] note %d 置 failed 失败: %v", noteID, err)
+		}
 	}
 }
 
@@ -92,25 +110,29 @@ type metaResult struct {
 }
 
 func process(noteID int64) error {
+	// 原子认领：仅当仍处于 pending 才置 processing，避免与其他路径并发重复处理
+	res := database.DB.Model(&models.Note{}).
+		Where("id = ? AND meta_status = 'pending' AND is_active = 1", noteID).
+		Update("meta_status", "processing")
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return nil // 状态已被其他路径改变（已认领/已删除/已重置）
+	}
+	log.Printf("[worker] note %d claimed", noteID)
+
+	// 认领成功后再读取笔记内容与处理起始的内容 hash（完成写入时据此检测处理期间的内容变更）
 	var note models.Note
 	if err := database.DB.Where("id = ? AND is_active = 1", noteID).First(&note).Error; err != nil {
-		return nil // 笔记已删除，静默跳过
+		return nil // 认领后又被删除，静默跳过
 	}
-	if note.MetaStatus != "pending" {
-		return nil // 状态已被其他路径改变
-	}
+	contentHash := note.MetaContentHash
 
 	// 取激活配置
 	cfg, err := services.GetActiveAIConfig()
 	if err != nil {
 		return markFailed(noteID, err.Error())
-	}
-
-	// 标记处理中
-	if err := database.DB.Model(&models.Note{}).
-		Where("id = ?", noteID).
-		Update("meta_status", "processing").Error; err != nil {
-		return err
 	}
 
 	// 调 AI 提取：模型通过 submit_note_metadata 工具返回结构化结果；
@@ -205,15 +227,27 @@ func process(noteID int64) error {
 			}
 		}
 
-		// 更新笔记
-		return tx.Model(&models.Note{}).
-			Where("id = ?", noteID).
+		// 更新笔记：带处理起始时的内容 hash 条件，若处理期间内容被修改则放弃写入
+		// （保存接口已重新置 pending 并入队，等下一轮用新内容再生成）
+		upd := tx.Model(&models.Note{}).
+			Where("id = ? AND meta_content_hash = ?", noteID, contentHash).
 			Updates(map[string]any{
 				"summary":     strings.TrimSpace(meta.Summary),
 				"meta_status": "done",
 				"meta_error":  "",
-			}).Error
+			})
+		if upd.Error != nil {
+			return upd.Error
+		}
+		if upd.RowsAffected == 0 {
+			return errContentChanged
+		}
+		return nil
 	})
+	if err == errContentChanged {
+		log.Printf("[worker] note %d 内容在处理期间已修改，放弃本次元数据写入，等待下一轮", noteID)
+		return nil
+	}
 	if err != nil {
 		return markFailed(noteID, "写入元数据失败: "+err.Error())
 	}

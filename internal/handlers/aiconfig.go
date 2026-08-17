@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"log"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -36,7 +37,8 @@ func toAIConfigVO(c *models.AIConfig) aiConfigVO {
 func ListAIConfigs(c *gin.Context) {
 	var cfgs []models.AIConfig
 	if err := database.DB.Where("is_active = 1").Order("id").Find(&cfgs).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 查询 AI 配置列表失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询 AI 配置列表失败"})
 		return
 	}
 	out := make([]aiConfigVO, 0, len(cfgs))
@@ -69,9 +71,11 @@ func CreateAIConfig(c *gin.Context) {
 		Model:   req.Model,
 	}
 	if err := database.DB.Create(&cfg).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 创建 AI 配置失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建 AI 配置失败"})
 		return
 	}
+	log.Printf("[handler] 创建 AI 配置 id=%d name=%q", cfg.ID, cfg.Name)
 	c.JSON(http.StatusOK, toAIConfigVO(&cfg))
 }
 
@@ -91,13 +95,15 @@ func UpdateAIConfig(c *gin.Context) {
 			"model":    req.Model,
 		})
 	if res.Error != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": res.Error.Error()})
+		log.Printf("[handler] 更新 AI 配置 id=%d 失败: %v", req.ID, res.Error)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新 AI 配置失败"})
 		return
 	}
 	if res.RowsAffected == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "配置不存在"})
 		return
 	}
+	log.Printf("[handler] 更新 AI 配置 id=%d name=%q", req.ID, req.Name)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -115,13 +121,15 @@ func DeleteAIConfig(c *gin.Context) {
 		Where("id = ? AND is_active = 1", req.ID).
 		Update("is_active", 0)
 	if res.Error != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": res.Error.Error()})
+		log.Printf("[handler] 删除 AI 配置 id=%d 失败: %v", req.ID, res.Error)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除 AI 配置失败"})
 		return
 	}
 	if res.RowsAffected == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "配置不存在"})
 		return
 	}
+	log.Printf("[handler] 删除 AI 配置 id=%d", req.ID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -159,9 +167,11 @@ func ActivateAIConfig(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 激活 AI 配置 id=%d 失败: %v", req.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "激活 AI 配置失败"})
 		return
 	}
+	log.Printf("[handler] 激活 AI 配置 id=%d", req.ID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 

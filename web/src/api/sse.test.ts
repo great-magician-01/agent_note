@@ -33,6 +33,7 @@ describe('postChatSSE', () => {
       tool_start: [],
       tool_end: [],
       note_updated: [],
+      note_proposal: [],
       done: [],
       error: [],
     }
@@ -43,6 +44,7 @@ describe('postChatSSE', () => {
       onToolStart: (d) => events.tool_start.push(d),
       onToolEnd: (d) => events.tool_end.push(d),
       onNoteUpdated: (d) => events.note_updated.push(d),
+      onNoteProposal: (d) => events.note_proposal.push(d),
       onDone: (d) => events.done.push(d),
       onError: (d) => events.error.push(d),
     }
@@ -54,6 +56,7 @@ describe('postChatSSE', () => {
         'event: tool_start\ndata: {"id":"t1","name":"search_notes","input":{"q":"x"}}',
         'event: tool_end\ndata: {"id":"t1","name":"search_notes","ok":true,"summary":"找到 2 条笔记","result":"{\\"total\\":2}"}',
         'event: note_updated\ndata: {"note_id":"n1"}',
+        'event: note_proposal\ndata: {"note_id":"n1","tool":"append_note_content","content":"# 新正文"}',
         'event: done\ndata: {"conversation_id":"c1"}',
         'event: error\ndata: {"message":"出错了"}',
       ].join('\n\n') + '\n\n'
@@ -73,6 +76,9 @@ describe('postChatSSE', () => {
       { id: 't1', name: 'search_notes', ok: true, summary: '找到 2 条笔记', result: '{"total":2}' },
     ])
     expect(events.note_updated).toEqual([{ note_id: 'n1' }])
+    expect(events.note_proposal).toEqual([
+      { note_id: 'n1', tool: 'append_note_content', content: '# 新正文' },
+    ])
     expect(events.done).toEqual([{ conversation_id: 'c1' }])
     expect(events.error).toEqual([{ message: '出错了' }])
   })
@@ -128,7 +134,7 @@ describe('postChatSSE', () => {
     try {
       await postChatSSE({ content: 'hi' }, {})
     } catch {
-      // happy-dom 下 location.href 赋值可能抛 "Not implemented: navigation"，此处只关心 token 已清
+      // router.push 在 happy-dom 下的导航问题不在此处关心，只断言 token 已清
     }
 
     expect(localStorage.getItem('token')).toBeNull()

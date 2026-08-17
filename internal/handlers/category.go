@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"log"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -19,7 +20,8 @@ type categoryReq struct {
 func ListCategories(c *gin.Context) {
 	var cats []models.Category
 	if err := database.DB.Where("is_active = 1").Order("sort, id").Find(&cats).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 查询分类列表失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询分类列表失败"})
 		return
 	}
 
@@ -60,9 +62,11 @@ func CreateCategory(c *gin.Context) {
 	}
 	cat := models.Category{ID: snowflake.Next(), Name: req.Name}
 	if err := database.DB.Create(&cat).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 创建分类失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建分类失败"})
 		return
 	}
+	log.Printf("[handler] 创建分类 id=%d name=%q", cat.ID, cat.Name)
 	c.JSON(http.StatusOK, cat)
 }
 
@@ -77,13 +81,15 @@ func UpdateCategory(c *gin.Context) {
 		Where("id = ? AND is_active = 1", req.ID).
 		Update("name", req.Name)
 	if res.Error != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": res.Error.Error()})
+		log.Printf("[handler] 更新分类 id=%d 失败: %v", req.ID, res.Error)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新分类失败"})
 		return
 	}
 	if res.RowsAffected == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "分类不存在"})
 		return
 	}
+	log.Printf("[handler] 更新分类 id=%d name=%q", req.ID, req.Name)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -108,8 +114,10 @@ func DeleteCategory(c *gin.Context) {
 			Update("category_id", nil).Error
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 删除分类 id=%d 失败: %v", req.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除分类失败"})
 		return
 	}
+	log.Printf("[handler] 删除分类 id=%d", req.ID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }

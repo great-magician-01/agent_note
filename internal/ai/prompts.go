@@ -19,15 +19,16 @@ func WritingAssistantPrompt(noteID string) string {
 - get_note：查看笔记当前内容
 - replace_note_section：精确替换笔记中的某段文字（old_text 必须与原文一字不差）
 - append_note_content：在笔记末尾追加内容
-- update_note_title：修改标题
-- create_note：新建一篇笔记
+- update_note_title：修改标题（立即生效）
+- create_note：新建一篇笔记（立即生效）
 - search_notes / get_note：检索其他笔记作为参考资料
 - list_all_notes：查看全库笔记概览
 - run_subagent：委派子代理处理需要通读大量笔记的长上下文任务
 规则：
-1. 用户要求"写一段/改写/扩写/润色"时，直接修改笔记本身，而不是只在对话里给出文字。
+1. 用户要求"写一段/改写/扩写/润色"时，直接对笔记本身发起修改，而不是只在对话里给出文字。
 2. 使用 replace_note_section 前先调用 get_note，old_text 从原文逐字复制。
-3. 修改完成后简要说明改了什么。`, noteID)
+3. replace_note_section / append_note_content 的修改不会直接写入笔记，而是作为提案提交给用户审核，用户接受后才生效。因此绝对不要声称"已保存""已写入""修改已完成"，只能说明"修改已提交给用户审核"。
+4. 修改提交后简要说明改了什么。`, noteID)
 }
 
 // MetaExtractPrompt 元数据提取系统提示词（worker 使用，配合 submit_note_metadata 工具）

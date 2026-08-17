@@ -173,6 +173,24 @@ export function buildViewItems(messages: ChatMessage[]): ChatViewItem[] {
 // 在飞请求的中断控制器（同一时间只有一个发送中请求，模块级即可）
 let abortCtrl: AbortController | null = null
 
+// AI 正文修改提案（note_proposal 事件，用户审核后由前端保存）
+export interface NoteProposal {
+  noteId: string
+  tool: string
+  content: string
+}
+
+// 把所有仍在 streaming 的 tool 消息收尾为「已中断」
+function interruptStreamingTools(messages: ChatMessage[]) {
+  for (const m of messages) {
+    if (m.role === 'tool' && m.streaming) {
+      m.streaming = false
+      m.toolOk = false
+      m.toolSummary = '已中断'
+    }
+  }
+}
+
 // 每个面板（global / note:<id>）一份独立聊天状态
 export const useChatStore = defineStore('chat', {
   state: () => ({
@@ -183,12 +201,18 @@ export const useChatStore = defineStore('chat', {
     scopeNoteId: '' as string, // '' = 全局会话；否则绑定笔记
     noteUpdatedFlag: 0, // 编辑器同步信号（自增）
     lastUpdatedNoteId: '' as string,
+    pendingProposal: null as NoteProposal | null, // 待审核的 AI 正文修改提案
   }),
   actions: {
     // 中断在飞的消息（停止按钮 / 切换会话 / 卸载面板时调用）；
     // fetch 断开后后端请求 ctx 取消，上游 AI 请求随之断开
     stop() {
       abortCtrl?.abort()
+      interruptStreamingTools(this.messages)
+    },
+
+    clearProposal() {
+      this.pendingProposal = null
     },
 
     // 切换作用域（进入首页 / 编辑页时调用）
@@ -348,6 +372,10 @@ export const useChatStore = defineStore('chat', {
             this.lastUpdatedNoteId = d.note_id
             this.noteUpdatedFlag++
           },
+          onNoteProposal: (d) => {
+            // 新提案直接覆盖旧提案（同一时间只需审核最新一份）
+            this.pendingProposal = { noteId: d.note_id, tool: d.tool, content: d.content }
+          },
           onDone: () => {
             finalizeRound()
             this.fetchConversations() // 更新会话排序/标题
@@ -363,6 +391,7 @@ export const useChatStore = defineStore('chat', {
       } catch (e: any) {
         if (e?.name === 'AbortError') {
           // 用户主动中断：保留已生成内容，不追加错误提示（后端会把部分输出落库）
+          interruptStreamingTools(this.messages)
         } else {
           errored = true
           const a = ensureAssistant()

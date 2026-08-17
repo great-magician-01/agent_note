@@ -108,42 +108,42 @@ func TestJWTAuth(t *testing.T) {
 		return w
 	}
 
-	t.Run("无 Authorization 头返回 401 missing token", func(t *testing.T) {
+	t.Run("无 Authorization 头返回 401 未提供登录凭证", func(t *testing.T) {
 		r, called := setup()
 		w := doGet(r, "")
 		if w.Code != http.StatusUnauthorized {
 			t.Fatalf("期望状态码 401，实际 %d", w.Code)
 		}
-		if got := respError(t, w); got != "missing token" {
-			t.Errorf("期望 error=missing token，实际 %q", got)
+		if got := respError(t, w); got != "未提供登录凭证" {
+			t.Errorf("期望 error=未提供登录凭证，实际 %q", got)
 		}
 		if *called {
 			t.Error("鉴权失败不应执行下游 handler")
 		}
 	})
 
-	t.Run("非 Bearer 前缀返回 401 missing token", func(t *testing.T) {
+	t.Run("非 Bearer 前缀返回 401 未提供登录凭证", func(t *testing.T) {
 		r, called := setup()
 		w := doGet(r, "Token abc.def.ghi")
 		if w.Code != http.StatusUnauthorized {
 			t.Fatalf("期望状态码 401，实际 %d", w.Code)
 		}
-		if got := respError(t, w); got != "missing token" {
-			t.Errorf("期望 error=missing token，实际 %q", got)
+		if got := respError(t, w); got != "未提供登录凭证" {
+			t.Errorf("期望 error=未提供登录凭证，实际 %q", got)
 		}
 		if *called {
 			t.Error("鉴权失败不应执行下游 handler")
 		}
 	})
 
-	t.Run("错误 secret 签发的 token 返回 401 invalid token", func(t *testing.T) {
+	t.Run("错误 secret 签发的 token 返回 401 登录凭证无效", func(t *testing.T) {
 		r, called := setup()
 		w := doGet(r, "Bearer "+signHS256(t, "wrong-secret"))
 		if w.Code != http.StatusUnauthorized {
 			t.Fatalf("期望状态码 401，实际 %d", w.Code)
 		}
-		if got := respError(t, w); got != "invalid token" {
-			t.Errorf("期望 error=invalid token，实际 %q", got)
+		if got := respError(t, w); got != "登录凭证无效" {
+			t.Errorf("期望 error=登录凭证无效，实际 %q", got)
 		}
 		if *called {
 			t.Error("鉴权失败不应执行下游 handler")
@@ -161,8 +161,8 @@ func TestJWTAuth(t *testing.T) {
 		if w.Code != http.StatusUnauthorized {
 			t.Fatalf("期望状态码 401，实际 %d", w.Code)
 		}
-		if got := respError(t, w); got != "invalid token" {
-			t.Errorf("期望 error=invalid token，实际 %q", got)
+		if got := respError(t, w); got != "登录凭证无效" {
+			t.Errorf("期望 error=登录凭证无效，实际 %q", got)
 		}
 		if *called {
 			t.Error("鉴权失败不应执行下游 handler")
@@ -184,8 +184,8 @@ func TestJWTAuth(t *testing.T) {
 		if w.Code != http.StatusUnauthorized {
 			t.Fatalf("期望状态码 401，实际 %d", w.Code)
 		}
-		if got := respError(t, w); got != "invalid token" {
-			t.Errorf("期望 error=invalid token，实际 %q", got)
+		if got := respError(t, w); got != "登录凭证无效" {
+			t.Errorf("期望 error=登录凭证无效，实际 %q", got)
 		}
 		if *called {
 			t.Error("鉴权失败不应执行下游 handler")

@@ -10,7 +10,7 @@
 - 分类笔记 + Markdown 编辑（ByteMD 编辑器，gfm / 代码高亮 / mermaid / 公式，粘贴图片自动上传）
 - 多 AI 配置（OpenAI 兼容：baseUrl / apiKey / model），同时仅一个激活
 - 保存笔记后由后台 worker 异步调用 AI 生成元数据（简介 / 标签 / 实体），失败可重试
-- AI 对话：首页全局助手检索笔记回答（关键词 + tags + 实体 ILIKE 检索，**不做 RAG / 向量**）；编辑页写作助手可通过工具直接修改当前笔记；对话为 SSE 流式
+- AI 对话：首页全局助手检索笔记回答（关键词 + tags + 实体 ILIKE 检索，已建 pg_trgm GIN 索引，**不做 RAG / 向量**）；编辑页写作助手可修改当前笔记，但正文修改走「提案审核制」（AI 产出提案 → 前端 diff 审核 → 用户接受才落库）；对话为 SSE 流式
 - 单管理员账号登录（env 配置），JWT 不含 exp（永不过期）
 
 ### 技术栈
@@ -34,7 +34,8 @@
 │   ├── services/            # 业务逻辑（笔记查询/检索/VO 转换、AI 配置、钩子）
 │   ├── ai/                  # OpenAI 兼容客户端（client.go）、提示词（prompts.go）、工具注册与执行（tools.go）、子代理运行器（subagent.go）、agent 循环收敛保障（agentloop.go）
 │   ├── router/              # 路由注册（router.go）+ SPA 托管（spa.go）
-│   ├── middleware/          # CORS / JWTAuth
+│   ├── middleware/          # CORS / JWTAuth / RequestLogger（请求访问日志）
+│   ├── logger/              # 按天切割的文件日志（<LOG_DIR>/log_yyyyMMdd.log，同时保留 stdout）
 │   ├── snowflake/           # 雪花 ID 生成（snowflake.Next()）
 │   └── worker/              # 元数据生成 worker pool（2 个 goroutine，chan 队列 + sync.Map 去重；调用记录落 ai_call_logs）
 ├── web/                     # Vue 3 + TS 前端（Vite）
@@ -106,7 +107,7 @@ docker run -d -p 7562:7562 \
 
 - 注释、日志、错误消息、设计文档均使用**中文**；标识符用英文。日志带包前缀，如 `[worker] note %d meta done`。
 - Go：标准 gofmt；handler 保持「解析参数 → 调用 service / 直接 GORM → 返回 JSON」的瘦结构，复杂业务放 `services`。GORM 用 `Model(&models.X{}).Where(...)` 链式调用 + `Updates(map[string]any{...})`。
-- 新增 AI 工具：在 `internal/ai/tools.go` 的 `init()` 里 `register`，并把工具名加入 `toolOrder`；写作类工具设 `Writing: true`（仅编辑页绑定笔记的会话可用）。子代理（run_subagent）可用工具由 `SubAgentTools()` 单独圈定（只读检索类），实现见 `internal/ai/subagent.go`。聊天 agent 循环在 `handlers/chat.go`：不设固定轮数上限，收敛靠 `internal/ai/agentloop.go` 的停滞检测（连续相同调用 → 无工具强制收尾）与上下文压缩（`CompactLoopMessages`，以上一轮接口返回的输入 token 超 400K 为触发，无 usage 时按字符数兜底）；token 用量归一化（输入/输出/缓存/思考）后随 assistant 消息落库。会话历史按总字数预算回溯，不按条数截断。
+- 新增 AI 工具：在 `internal/ai/tools.go` 的 `init()` 里 `register`，并把工具名加入 `toolOrder`；写作类工具设 `Writing: true`（仅编辑页绑定笔记的会话可用）。**正文修改类工具（replace_note_section / append_note_content）走提案制：执行后产出 `NoteProposal` 并经 SSE `note_proposal` 事件推给前端审核，不直接写库**（用户接受后由前端走 `/api/notes/update` 落库）；`update_note_title` / `create_note` 等直写工具仍发 `note_updated`。写作工具执行时服务端强制校验 note_id 必须等于会话绑定笔记（`ai.WithBoundNoteID` 注入 ctx）。子代理（run_subagent）可用工具由 `SubAgentTools()` 单独圈定（只读检索类），执行前服务端强制白名单校验，实现见 `internal/ai/subagent.go`。聊天 agent 循环在 `handlers/chat.go`：不设固定轮数上限，收敛靠 `internal/ai/agentloop.go` 的停滞检测（连续相同调用 → 无工具强制收尾）与上下文压缩（`CompactLoopMessages`，以上一轮接口返回的输入 token 超 400K 为触发，无 usage 时按字符数兜底）；循环期间每 15s 发 `: ping` SSE 注释心跳防空闲断连；token 用量归一化（输入/输出/缓存/思考）后随 assistant 消息落库。会话历史按总字数预算回溯（先限最近 200 条），不按条数截断。
 - 前端：组合式 API + `<script setup lang="ts">`；接口请求统一走 `web/src/api/client.ts` 的 axios 实例（自动带 Bearer token，401 自动跳登录）；SSE 走 `web/src/api/sse.ts`。雪花 ID 在前端始终以 `string` 处理。
 - 前端视觉体系（深色「夜墨」默认 / 浅色「晨雾」，青玉色 = AI、靛蓝 = 用户）见 `docs/frontend-design.md`，改 UI 前先读它。
 
@@ -125,5 +126,5 @@ docker run -d -p 7562:7562 \
 - JWT 签名密钥来自 `JWT_SECRET`，默认值 `dev-secret-please-change` 会在启动时打 WARNING；生产必须修改。JWT 不含 exp（永不过期），这是已确认的设计决策。
 - 单管理员账号由 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 环境变量定义，无注册功能。
 - CORS 中间件目前 `Access-Control-Allow-Origin: *`（面向开发环境 vite dev server），生产部署时留意。
-- 上传限制：仅图片扩展名（png/jpg/jpeg/gif/webp/svg）、10MB 上限，文件名用雪花 ID 重写后存 `UPLOAD_DIR`，经 `/uploads` 静态服务暴露（**无鉴权**）。
+- 上传限制：仅图片扩展名（png/jpg/jpeg/gif/webp，**svg 可携带脚本已移除**）、10MB 上限，文件名用雪花 ID 重写后存 `UPLOAD_DIR`，经 `/uploads` 静态服务暴露（**无鉴权**）；静态服务带 `X-Content-Type-Options: nosniff` 与 `Content-Security-Policy: script-src 'none'; sandbox` 安全头（自定义 handler，保留 `filepath.Clean` 防目录逃逸）。
 - SPA 托管路径拼接使用 `filepath.Clean("/"+p)` 防目录逃逸，改动 `spa.go` 时保留该防护。

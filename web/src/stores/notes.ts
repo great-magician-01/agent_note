@@ -29,18 +29,27 @@ export interface NoteListParams {
   page_size?: number
 }
 
+// fetch 请求序号：只接受最后一次请求的响应落地（防竞态）
+let fetchSeq = 0
+
 export const useNoteStore = defineStore('notes', {
   state: () => ({
     items: [] as NoteItem[],
     total: 0,
     loading: false,
+    error: null as string | null,
     keyword: '',
     entityFilter: '',
     page: 1,
     pageSize: 30,
   }),
+  getters: {
+    hasMore: (s) => s.items.length < s.total,
+  },
   actions: {
-    async fetch(categoryId?: string) {
+    async fetch(categoryId?: string, append = false) {
+      const seq = ++fetchSeq
+      if (!append) this.page = 1
       this.loading = true
       try {
         const params: NoteListParams = {
@@ -51,11 +60,23 @@ export const useNoteStore = defineStore('notes', {
         if (this.keyword) params.keyword = this.keyword
         if (this.entityFilter) params.entity = this.entityFilter
         const { data } = await api.get('/notes', { params })
-        this.items = data.items || []
+        if (seq !== fetchSeq) return // 已有更新的请求，丢弃本次响应
+        this.items = append ? [...this.items, ...(data.items || [])] : data.items || []
         this.total = data.total || 0
+        this.error = null
+      } catch (e: any) {
+        if (seq !== fetchSeq) return
+        if (append) this.page-- // 追加失败回滚页码，便于重试
+        this.error = e.response?.data?.error || '加载失败，请检查网络后重试'
       } finally {
-        this.loading = false
+        if (seq === fetchSeq) this.loading = false
       }
+    },
+    // 无限滚动：下一页追加到 items
+    async loadMore(categoryId?: string) {
+      if (this.loading || !this.hasMore) return
+      this.page++
+      await this.fetch(categoryId, true)
     },
     setKeyword(kw: string) {
       this.keyword = kw

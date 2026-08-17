@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"log"
 	"net/http"
 	"strconv"
 
@@ -29,7 +30,8 @@ func ListNotes(c *gin.Context) {
 
 	notes, total, err := services.ListNotes(q)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 查询笔记列表失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询笔记列表失败"})
 		return
 	}
 
@@ -39,7 +41,8 @@ func ListNotes(c *gin.Context) {
 	}
 	tagMap, entityMap, err := services.LoadNoteMeta(ids)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 加载笔记元数据失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询笔记列表失败"})
 		return
 	}
 
@@ -91,13 +94,15 @@ func CreateNote(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 创建笔记失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建笔记失败"})
 		return
 	}
 
 	// 通知 worker（阶段 4 实现；现在为空操作钩子）
 	services.OnNoteContentChanged(note.ID)
 
+	log.Printf("[handler] 创建笔记 id=%d", note.ID)
 	c.JSON(http.StatusOK, services.ToVO(&note, nil, nil, true))
 }
 
@@ -153,13 +158,15 @@ func UpdateNote(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 保存笔记 id=%d 失败: %v", note.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存笔记失败"})
 		return
 	}
 
 	if contentChanged {
 		services.OnNoteContentChanged(note.ID)
 	}
+	log.Printf("[handler] 更新笔记 id=%d（内容变化=%v）", note.ID, contentChanged)
 
 	// 重新读取最新状态
 	database.DB.Where("id = ?", note.ID).First(&note)
@@ -216,9 +223,11 @@ func DeleteNote(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 删除笔记 id=%d 失败: %v", req.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除笔记失败"})
 		return
 	}
+	log.Printf("[handler] 删除笔记 id=%d", req.ID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -268,9 +277,11 @@ func BatchDeleteNotes(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 批量删除笔记失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "批量删除笔记失败"})
 		return
 	}
+	log.Printf("[handler] 批量删除笔记 ids=%v", ids)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -297,7 +308,8 @@ func BatchMoveNotes(c *gin.Context) {
 		if err := database.DB.Model(&models.Category{}).
 			Where("id = ? AND is_active = 1", *req.CategoryID).
 			Count(&cnt).Error; err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			log.Printf("[handler] 查询目标分类失败: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "批量移动笔记失败"})
 			return
 		}
 		if cnt == 0 {
@@ -309,9 +321,11 @@ func BatchMoveNotes(c *gin.Context) {
 	if err := database.DB.Model(&models.Note{}).
 		Where("id IN ? AND is_active = 1", ids).
 		Update("category_id", req.CategoryID).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 批量移动笔记失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "批量移动笔记失败"})
 		return
 	}
+	log.Printf("[handler] 批量移动笔记 ids=%v category=%v", ids, req.CategoryID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -357,7 +371,8 @@ func RegenerateMeta(c *gin.Context) {
 		Where("id = ? AND is_active = 1", req.ID).
 		Updates(map[string]any{"meta_status": "pending", "meta_error": ""})
 	if res.Error != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": res.Error.Error()})
+		log.Printf("[handler] 重新生成元数据 id=%d 失败: %v", req.ID, res.Error)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "操作失败，请稍后重试"})
 		return
 	}
 	if res.RowsAffected == 0 {
@@ -365,6 +380,7 @@ func RegenerateMeta(c *gin.Context) {
 		return
 	}
 	services.OnNoteContentChanged(req.ID)
+	log.Printf("[handler] 重新生成元数据 id=%d", req.ID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 

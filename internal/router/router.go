@@ -1,6 +1,8 @@
 package router
 
 import (
+	"path/filepath"
+
 	"github.com/gin-gonic/gin"
 	"github.com/great-magician-01/agent_note/internal/config"
 	"github.com/great-magician-01/agent_note/internal/handlers"
@@ -13,10 +15,17 @@ func Setup() *gin.Engine {
 	}
 
 	r := gin.New()
-	r.Use(gin.Recovery(), middleware.CORS())
+	r.Use(gin.Recovery(), middleware.RequestLogger(), middleware.CORS())
 
-	// 静态文件：上传的图片
-	r.Static("/uploads", config.C.UploadDir)
+	// 静态文件：上传的图片（带安全头，防内容嗅探与脚本执行；路径 Clean 防目录逃逸）
+	serveUpload := func(c *gin.Context) {
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("Content-Security-Policy", "script-src 'none'; sandbox")
+		fp := filepath.Join(config.C.UploadDir, filepath.Clean("/"+c.Param("filepath")))
+		c.File(fp)
+	}
+	r.GET("/uploads/*filepath", serveUpload)
+	r.HEAD("/uploads/*filepath", serveUpload)
 
 	api := r.Group("/api")
 	{

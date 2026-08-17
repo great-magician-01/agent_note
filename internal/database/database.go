@@ -40,7 +40,25 @@ func Init() {
 	if err := AutoMigrate(); err != nil {
 		log.Fatalf("[database] migrate failed: %v", err)
 	}
+	ensureSearchIndexes()
 	log.Println("[database] connected & migrated")
+}
+
+// ensureSearchIndexes 容错安装 pg_trgm 扩展并为 notes.title / content_md 建 GIN 索引
+// （加速 ILIKE 关键词检索）。任何一步失败仅警告，不中断启动。
+func ensureSearchIndexes() {
+	schema := config.C.DBSchema
+	stmts := []string{
+		`CREATE EXTENSION IF NOT EXISTS pg_trgm`,
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_notes_title_trgm ON "%s".notes USING gin (title gin_trgm_ops)`, schema),
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_notes_content_trgm ON "%s".notes USING gin (content_md gin_trgm_ops)`, schema),
+	}
+	for _, stmt := range stmts {
+		if err := DB.Exec(stmt).Error; err != nil {
+			log.Printf("[database] 检索索引初始化跳过（不影响启动）: %v; sql=%s", err, stmt)
+			return
+		}
+	}
 }
 
 func AutoMigrate() error {

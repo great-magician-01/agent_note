@@ -126,16 +126,39 @@ function onGlobalKeydown(e: KeyboardEvent) {
   }
 }
 
-// 有笔记处于 pending/processing 时轮询刷新，元数据生成完成自动出现
-function ensureMetaPolling() {
-  clearInterval(metaPollTimer)
-  metaPollTimer = setInterval(() => {
-    const hasPending = noteStore.items.some(
-      (n) => n.meta_status === 'pending' || n.meta_status === 'processing',
-    )
-    if (hasPending) refresh()
-  }, 5000)
+// 有笔记处于 pending/processing 时才轮询刷新（元数据生成完成自动出现）；无 pending 停表
+function updateMetaPolling() {
+  const hasPending = noteStore.items.some(
+    (n) => n.meta_status === 'pending' || n.meta_status === 'processing',
+  )
+  if (hasPending && !metaPollTimer) {
+    metaPollTimer = setInterval(refresh, 5000)
+  } else if (!hasPending && metaPollTimer) {
+    clearInterval(metaPollTimer)
+    metaPollTimer = undefined
+  }
 }
+
+watch(
+  () => noteStore.items.some((n) => n.meta_status === 'pending' || n.meta_status === 'processing'),
+  updateMetaPolling,
+)
+
+// ---- 无限滚动：底部哨兵进入视口时加载下一页 ----
+const sentinelEl = ref<HTMLElement>()
+let sentinelObserver: IntersectionObserver | undefined
+
+// 哨兵元素随 v-if 重建，出现时挂到 observer 上（重复 observe 同一元素是 no-op）
+watch(
+  sentinelEl,
+  (el) => {
+    if (el) sentinelObserver?.observe(el)
+  },
+  { flush: 'post' },
+)
+
+// 窄屏（<lg）AI 助手全屏抽屉开关
+const mobileChatOpen = ref(false)
 
 watch(
   () => catStore.activeId,
@@ -162,21 +185,28 @@ watch(
 
 onMounted(async () => {
   await catStore.fetch()
-  refresh()
-  ensureMetaPolling()
+  await refresh()
+  updateMetaPolling()
+  sentinelObserver = new IntersectionObserver((entries) => {
+    if (entries.some((e) => e.isIntersecting)) {
+      noteStore.loadMore(catStore.activeId || undefined)
+    }
+  })
+  if (sentinelEl.value) sentinelObserver.observe(sentinelEl.value) // 首个哨兵（watch 兜底后续重建）
   window.addEventListener('keydown', onGlobalKeydown)
 })
 
 onUnmounted(() => {
   clearTimeout(debounceTimer)
   clearInterval(metaPollTimer)
+  sentinelObserver?.disconnect()
   window.removeEventListener('keydown', onGlobalKeydown)
 })
 </script>
 
 <template>
-  <div class="h-full flex flex-col items-center px-4">
-    <div class="w-full max-w-[70%] flex flex-col h-full py-6">
+  <div class="h-full flex flex-col items-center px-2 lg:px-4">
+    <div class="w-full lg:max-w-[70%] flex flex-col h-full py-3 lg:py-6">
       <TopBar :show-search="true" @search="onSearch" />
 
       <main class="glass reveal reveal-2 rounded-[20px] flex-1 mt-3 flex overflow-hidden min-h-0">
@@ -213,6 +243,18 @@ onUnmounted(() => {
           </div>
 
           <div class="flex-1 overflow-y-auto px-5 pb-5 space-y-3">
+            <!-- 加载失败：错误条 + 重试（优先于空态） -->
+            <div
+              v-if="noteStore.error"
+              class="flex items-center gap-3 px-4 py-3 rounded-[12px] text-[13px] text-[var(--danger)] border border-[color-mix(in_srgb,var(--danger)_35%,transparent)] bg-[color-mix(in_srgb,var(--danger)_8%,transparent)]"
+            >
+              <span class="flex-1 min-w-0 truncate">{{ noteStore.error }}</span>
+              <button
+                class="h-7 px-3 rounded-[8px] text-[12px] text-[var(--text-1)] border border-[var(--glass-border-strong)] hover:bg-[var(--glass-2)] transition-colors shrink-0"
+                @click="refresh"
+              >重试</button>
+            </div>
+
             <NoteCard
               v-for="note in noteStore.items"
               :key="note.id"
@@ -224,9 +266,20 @@ onUnmounted(() => {
               @filter-entity="onFilterEntity"
             />
 
+            <!-- 无限滚动哨兵 -->
+            <div v-if="noteStore.items.length > 0" ref="sentinelEl" class="h-1" />
+            <p
+              v-if="noteStore.loading && noteStore.items.length > 0"
+              class="text-center text-[12px] text-[var(--text-3)] py-2"
+            >加载中…</p>
+            <p
+              v-else-if="noteStore.items.length > 0 && !noteStore.hasMore"
+              class="text-center text-[12px] text-[var(--text-3)] py-2"
+            >没有更多了</p>
+
             <!-- 空状态 -->
             <div
-              v-if="!noteStore.loading && noteStore.items.length === 0"
+              v-if="!noteStore.loading && !noteStore.error && noteStore.items.length === 0"
               class="h-full flex flex-col items-center justify-center gap-3 py-20"
             >
               <div class="w-20 h-20 rounded-full border border-dashed border-[var(--glass-border-strong)] flex items-center justify-center text-[28px] text-[var(--text-3)]">
@@ -288,11 +341,32 @@ onUnmounted(() => {
           </div>
         </section>
 
-        <!-- 右：AI 对话栏 -->
-        <aside class="w-[380px] shrink-0 border-l border-[var(--glass-border)] flex flex-col min-h-0">
-          <ChatPanel scope="global" />
+        <!-- 右：AI 对话栏（窄屏为全屏抽屉，transform 滑入滑出） -->
+        <aside
+          class="w-[380px] shrink-0 border-l border-[var(--glass-border)] flex flex-col min-h-0 max-lg:fixed max-lg:inset-0 max-lg:z-40 max-lg:w-full max-lg:border-l-0 max-lg:bg-[var(--ink)] max-lg:transition-transform max-lg:duration-300"
+          :class="mobileChatOpen ? 'max-lg:translate-x-0' : 'max-lg:translate-x-full'"
+        >
+          <div class="lg:hidden shrink-0 flex items-center justify-between px-4 py-2.5 border-b border-[var(--glass-border)]">
+            <span class="text-[13px] text-[var(--text-2)]">AI 助手</span>
+            <button
+              class="w-8 h-8 rounded-[8px] flex items-center justify-center text-[var(--text-2)] hover:bg-[var(--glass-2)] hover:text-[var(--text-1)] transition-colors"
+              title="关闭"
+              @click="mobileChatOpen = false"
+            >✕</button>
+          </div>
+          <div class="flex-1 min-h-0 flex flex-col">
+            <ChatPanel scope="global" />
+          </div>
         </aside>
       </main>
     </div>
+
+    <!-- 窄屏：打开 AI 助手抽屉的浮钮 -->
+    <button
+      v-if="!mobileChatOpen"
+      class="lg:hidden fixed bottom-5 right-5 z-30 w-12 h-12 rounded-full text-white text-[18px] bg-gradient-to-br from-[var(--accent)] to-[var(--accent-deep)] shadow-lg hover:brightness-110 transition-all"
+      title="AI 助手"
+      @click="mobileChatOpen = true"
+    >✦</button>
   </div>
 </template>

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"log"
 	"net/http"
 	"strconv"
 
@@ -25,7 +26,8 @@ func ListConversations(c *gin.Context) {
 
 	var convs []models.Conversation
 	if err := db.Order("updated_at DESC").Find(&convs).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 查询会话列表失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询会话列表失败"})
 		return
 	}
 	c.JSON(http.StatusOK, convs)
@@ -38,11 +40,29 @@ func CreateConversation(c *gin.Context) {
 	}
 	_ = c.ShouldBindJSON(&req)
 
+	// 绑定笔记的会话：校验笔记存在且未删除
+	if req.NoteID != nil {
+		var cnt int64
+		if err := database.DB.Model(&models.Note{}).
+			Where("id = ? AND is_active = 1", *req.NoteID).
+			Count(&cnt).Error; err != nil {
+			log.Printf("[handler] 校验会话绑定笔记 id=%d 失败: %v", *req.NoteID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "创建会话失败"})
+			return
+		}
+		if cnt == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "绑定的笔记不存在"})
+			return
+		}
+	}
+
 	conv := models.Conversation{ID: snowflake.Next(), NoteID: req.NoteID}
 	if err := database.DB.Create(&conv).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 创建会话失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建会话失败"})
 		return
 	}
+	log.Printf("[handler] 创建会话 id=%d note_id=%v", conv.ID, req.NoteID)
 	c.JSON(http.StatusOK, conv)
 }
 
@@ -67,9 +87,11 @@ func DeleteConversation(c *gin.Context) {
 			Update("is_active", 0).Error
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 删除会话 id=%d 失败: %v", req.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除会话失败"})
 		return
 	}
+	log.Printf("[handler] 删除会话 id=%d", req.ID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -85,7 +107,8 @@ func ListMessages(c *gin.Context) {
 		Where("conversation_id = ? AND is_active = 1", convID).
 		Order("id").
 		Find(&msgs).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("[handler] 查询会话消息 conv=%d 失败: %v", convID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询消息失败"})
 		return
 	}
 	c.JSON(http.StatusOK, msgs)

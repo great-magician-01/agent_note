@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -24,14 +25,25 @@ const (
 	maxHistoryRunes = 60_000
 )
 
-// SSE 事件写出助手
+// SSE 事件写出助手（心跳 goroutine 与主循环并发写同一 ResponseWriter，写路径统一加锁）
 type sseWriter struct {
-	c *gin.Context
+	c  *gin.Context
+	mu sync.Mutex
 }
 
 func (w *sseWriter) event(name string, data any) {
 	raw, _ := json.Marshal(data)
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	fmt.Fprintf(w.c.Writer, "event: %s\ndata: %s\n\n", name, raw)
+	w.c.Writer.Flush()
+}
+
+// ping 发送 SSE 注释心跳，防止 agent 循环长时间无事件导致连接被判定空闲断开
+func (w *sseWriter) ping() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	fmt.Fprint(w.c.Writer, ": ping\n\n")
 	w.c.Writer.Flush()
 }
 
@@ -53,7 +65,7 @@ func Chat(c *gin.Context) {
 	c.Writer.Header().Set("Cache-Control", "no-cache")
 	c.Writer.Header().Set("Connection", "keep-alive")
 	c.Writer.Header().Set("X-Accel-Buffering", "no")
-	sse := &sseWriter{c}
+	sse := &sseWriter{c: c}
 
 	fail := func(msg string) {
 		sse.event("error", gin.H{"message": msg})
@@ -111,11 +123,12 @@ func Chat(c *gin.Context) {
 		"user_message_id": strconv.FormatInt(userMsg.ID, 10),
 	})
 
-	// 4. 加载上下文：从最新开始按总字数预算回溯（不按固定条数截断）
+	// 4. 加载上下文：先限量取最近 200 条（防超长会话全量扫描），再按总字数预算回溯
 	var history []models.Message
 	database.DB.
 		Where("conversation_id = ? AND is_active = 1", conv.ID).
 		Order("id DESC").
+		Limit(200).
 		Find(&history)
 	kept := len(history)
 	acc := 0
@@ -165,6 +178,28 @@ func Chat(c *gin.Context) {
 	client := ai.NewClient(cfg.BaseURL, cfg.APIKey, cfg.Model)
 	tools := ai.ToolsForScope(conv.NoteID != nil)
 	ctx := c.Request.Context()
+	// 会话绑定笔记时注入绑定 id，正文类写作工具强制校验目标笔记
+	if conv.NoteID != nil {
+		ctx = ai.WithBoundNoteID(ctx, *conv.NoteID)
+	}
+
+	// SSE 心跳：agent 循环可能长时间无事件产出，每 15s 发注释行防连接空闲断开
+	pingDone := make(chan struct{})
+	defer close(pingDone)
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pingDone:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sse.ping()
+			}
+		}
+	}()
 
 	var pendingMsgs []models.Message // 待落库消息（本轮产生的 assistant/tool）
 
@@ -292,7 +327,14 @@ func Chat(c *gin.Context) {
 			if ok {
 				toolContent = toolResult.Content
 				summary = toolSummary(tc.Function.Name, toolResult)
-				if toolResult.NoteUpdated != nil {
+				if toolResult.Proposal != nil {
+					// 正文修改提案：推给前端审核，用户接受后才落库，不发 note_updated
+					sse.event("note_proposal", gin.H{
+						"note_id": strconv.FormatInt(toolResult.Proposal.NoteID, 10),
+						"tool":    toolResult.Proposal.Tool,
+						"content": toolResult.Proposal.NewContent,
+					})
+				} else if toolResult.NoteUpdated != nil {
 					sse.event("note_updated", gin.H{"note_id": strconv.FormatInt(*toolResult.NoteUpdated, 10)})
 				}
 			} else {
@@ -348,9 +390,9 @@ func toolSummary(name string, r *ai.ToolResult) string {
 	case "list_categories":
 		return "已获取分类列表"
 	case "replace_note_section":
-		return "已替换笔记内容"
+		return "已提交替换修改，待用户审核"
 	case "append_note_content":
-		return "已追加内容到笔记"
+		return "已提交追加修改，待用户审核"
 	case "update_note_title":
 		return "已修改笔记标题"
 	case "create_note":

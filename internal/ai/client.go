@@ -12,6 +12,10 @@ import (
 	"time"
 )
 
+// sharedHTTPClient 包级共享 HTTP 客户端：复用 Transport/连接池。
+// 不设总超时（流式长连接），每次调用的超时由 ctx 控制（如 ChatToolCall 的 120s、ChatOnce 的 30s）
+var sharedHTTPClient = &http.Client{Timeout: 0}
+
 // Client OpenAI 兼容客户端（任意 baseUrl 通用）
 type Client struct {
 	BaseURL string
@@ -25,7 +29,7 @@ func NewClient(baseURL, apiKey, model string) *Client {
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		APIKey:  apiKey,
 		Model:   model,
-		http:    &http.Client{Timeout: 0}, // 流式长连接不设总超时，由 ctx 控制
+		http:    sharedHTTPClient,
 	}
 }
 
@@ -151,9 +155,9 @@ func (r *usageRaw) normalize() *Usage {
 // StreamResult 一轮流式调用的聚合结果
 type StreamResult struct {
 	Content   string
-	Reasoning string     // 思考内容（推理模型，可能为空）
+	Reasoning string // 思考内容（推理模型，可能为空）
 	ToolCalls []ToolCall
-	Usage     *Usage     // token 用量（请求带 include_usage；服务商不返回时为空）
+	Usage     *Usage // token 用量（请求带 include_usage；服务商不返回时为空）
 }
 
 // ChatStream 发起流式 chat 请求；onDelta 回调正文增量，onThink 回调思考增量（均可为 nil）。
